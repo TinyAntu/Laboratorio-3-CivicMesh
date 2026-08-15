@@ -1,13 +1,8 @@
 from __future__ import annotations
-
-import time
 import uuid
 from typing import Callable
-
 from .membership import Membership
 from .messages import Message
-
-
 class Gossip:
     """Coordinador de membresia gossip.
 
@@ -21,12 +16,15 @@ class Gossip:
         send: Callable,
         interval: float = 2.0,
     ):
+
         self.membership = membership
         self.send = send
         self.interval = interval
         self.running = False
 
+    # Construye un mensaje con la informacion de membresia local.
     def build_message(self) -> Message:
+
         return Message(
             type="MEMBERSHIP_GOSSIP",
             sender_id=self.membership.self_peer.node_id,
@@ -36,25 +34,33 @@ class Gossip:
             priority=100,
         )
 
+    # Ejecuta una ronda de gossip.
     def round(self) -> int:
+
+        # Contador de mensajes enviados correctamente.
         sent = 0
         message = self.build_message()
 
         for peer in self.membership.select_gossip_targets():
+
             try:
                 self.send(peer, message)
                 sent += 1
+
             except OSError:
-                # The failure detector will determine whether the peer is down.
                 pass
 
         self.membership.run_failure_check()
         self.membership.remove_failed()
         return sent
 
+    # Procesa un mensaje recibido.
     def handle(self, message: Message) -> int:
+
         if message.type != "MEMBERSHIP_GOSSIP":
             return 0
 
         members = message.payload.get("members", [])
+
+
         return self.membership.merge(members)

@@ -10,10 +10,12 @@ from .failure_detector import FailureDetector
 
 @dataclass
 class MembershipConfig:
+    # Configuración del sistema de membresia.
+
+    # Cantidad maxima de nodos a los que se enviará gossip.
     gossip_fanout: int = 2
     failure_timeout: float = 5.0
     suspect_timeout: float = 5.0
-
 
 class Membership:
     """Vista parcial de la membresia con gossip periodico y deteccion de timeout."""
@@ -33,14 +35,18 @@ class Membership:
         )
         self.rng = random.Random(seed)
 
+    # Agrega un nodo a la vista de membresia o actualiza su informacion.
     def add_peer(self, peer: PeerInfo, now: float | None = None) -> bool:
+
         if peer.node_id == self.self_peer.node_id:
             return False
 
         now = time.monotonic() if now is None else now
         current = self.peers.get(peer.node_id)
 
+        # Busca si el nodo ya existe en la membresía.
         if current is None or peer.incarnation >= current.incarnation:
+
             peer.last_seen = now
             peer.status = "alive"
             self.peers[peer.node_id] = peer
@@ -49,62 +55,97 @@ class Membership:
 
         return False
 
+
+    # Actualiza la informacion de un nodo cuando se recibe una señal de vida.
     def mark_seen(self, node_id: str, now: float | None = None) -> None:
+
         now = time.monotonic() if now is None else now
         peer = self.peers.get(node_id)
+
         if peer:
+
             peer.last_seen = now
             peer.status = "alive"
             self.failure_detector.observe(node_id, now)
 
+    # Elimina de la membresia los nodos considerados fallidos.
     def remove_failed(self) -> list[str]:
+
         removed = []
+
         for node_id, peer in list(self.peers.items()):
+
             if peer.status == "failed":
+
                 removed.append(node_id)
                 del self.peers[node_id]
                 self.failure_detector.remove(node_id)
+
         return removed
 
+    # Selecciona uniformemente hasta un numero determinado de nodos activos de la vista parcial para la propagacion (fanout).
     def select_gossip_targets(self, fanout: int | None = None) -> list[PeerInfo]:
-        """Selecciona uniformemente hasta un numero determinado de nodos activos de la vista parcial para la propagacion (fanout)."""
+
         fanout = self.config.gossip_fanout if fanout is None else fanout
+
         candidates = [
             peer for peer in self.peers.values()
             if peer.status == "alive"
         ]
+
         if not candidates:
             return []
+
         return self.rng.sample(candidates, min(fanout, len(candidates)))
 
+    # Integra en la membresia la informacion recibida desde otro nodo.
     def merge(self, remote_peers: list[dict], now: float | None = None) -> int:
+
+        # Cuenta cuantos nodos fueron agregados o actualizados.
         changed = 0
+
         for raw in remote_peers:
+
             peer = PeerInfo.from_dict(raw)
+
             if self.add_peer(peer, now=now):
                 changed += 1
-        return changed
 
+        return changed
+  
+
+    # Genera la informacion que sera compartida mediante gossip.
     def gossip_view(self) -> list[dict]:
+
         return [
             peer.to_dict()
             for peer in self.peers.values()
             if peer.status != "failed"
         ]
 
+    # Ejecuta una comprobacion de fallos sobre los nodos conocidos.
     def run_failure_check(self, now: float | None = None) -> dict[str, str]:
+
         changes = self.failure_detector.check(now=now)
+
         for node_id, status in changes.items():
+
             if node_id in self.peers:
+
                 self.peers[node_id].status = status
+
         return changes
 
+    # Genera una representacion completa del estado actual.
     def snapshot(self) -> dict:
+
         return {
             "self": self.self_peer.to_dict(),
+
             "peers": {
                 node_id: peer.to_dict()
                 for node_id, peer in self.peers.items()
             },
+
             "failure_detector": self.failure_detector.snapshot(),
         }
