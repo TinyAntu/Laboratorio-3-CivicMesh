@@ -1,0 +1,33 @@
+name: Agente Revisor de Bugs IA
+
+on:
+  #schedule:
+    # Se ejecuta todos los días a las 03:30  (Por ahora no dejaremos que se ejecute)
+    #- cron: '0 5 * * *'
+  workflow_dispatch: 
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  run-bug-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias
+        run: pip install -r scripts/agents/requirements.txt
+
+      - name: Ejecutar Agente Revisor de Bugs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python scripts/agents/bug_agent.py
