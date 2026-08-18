@@ -1,7 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Outputs & Runs
+/runs/
+/metrics/
+/logs/
+*.log
+*.err
 *.dat
 *.png
 *.gif
 *.exe
-# ignorar la carpeta build
+
+# Builds
 /build
 /build_wsl
