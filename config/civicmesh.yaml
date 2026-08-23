@@ -1,0 +1,42 @@
+seed: 42
+
+simulation:
+  delta_t: 1.0
+  interval_seconds: 1.0
+
+crime:
+  rates:
+    Santiago:
+      robo: 0.90
+      hurto: 0.60
+      violencia: 0.20
+    Las Condes:
+      robo: 0.45
+      hurto: 0.35
+      violencia: 0.10
+    Quilicura:
+      robo: 0.70
+      hurto: 0.50
+      violencia: 0.15
+
+crime_perception:
+  alpha: 0.80
+  beta0: -1.0
+  beta1: 0.40
+  beta2: 0.80
+  sigma_epsilon: 0.10
+
+air:
+  pollutant: pm2_5
+  datasets:
+    Santiago: data/air_quality/santiago.csv
+    Las Condes: data/air_quality/las_condes.csv
+    Quilicura: data/air_quality/quilicura.csv
+
+air_perception:
+  alpha: 0.85
+  gamma: 0.60
+  delta: 0.30
+  sigma_epsilon: 2.0
+  clip_min: 0.0
+  clip_max: 500.0
