@@ -5,9 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-08-23
+
+### Added
+
+- Se implementó el bug_agent con soporte para config y modo prioritario.
+
+
 ## [1.0.0] - 2026-08-09
 
 ### Added
 
 - Archivos básicos necesarios.
 - Modificaciones de agentes para el nuevo contexto.
+
