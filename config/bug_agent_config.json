@@ -1,0 +1,13 @@
+{
+  "include_directories": [
+    "network",
+    "domains"
+  ],
+  "exclude_files": [
+    "__init__.py"
+  ],
+  "max_files_per_run": 5,
+  "min_lines_per_file": 15,
+  "delay_between_requests_sec": 2,
+  "scan_mode": "priority"
+}
