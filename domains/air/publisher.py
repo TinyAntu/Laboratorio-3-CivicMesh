@@ -45,7 +45,7 @@ class AirQualityPublisher:
         self.peer.on_message(self._handle_message)
 
     def _handle_message(self, message: Message) -> None:
-        """Guarda rumores subjetivos del mismo tópico y dominio."""
+        """Guarda rumores subjetivos recibidos desde la malla."""
         if message.type != MSG_PUBLISH:
             return
 
@@ -54,11 +54,8 @@ class AirQualityPublisher:
         if payload.get("channel") != CHANNEL_SUBJECTIVE:
             return
 
-        if payload.get("topic") != self.commune:
-            return
-
-        # Evitar que el propio mensaje subjetivo se considere rumor.
-        if payload.get("source_id") == self.peer.info.node_id:
+        # Descartar únicamente el despacho local inmediato del propio mensaje recién emitido
+        if payload.get("source_id") == self.peer.info.node_id and message.hop_count == 0:
             return
 
         metadata = payload.get("metadata", {})
@@ -72,10 +69,9 @@ class AirQualityPublisher:
 
         try:
             value = float(payload["value"])
+            self.received_rumors.append(value)
         except (KeyError, TypeError, ValueError):
             return
-
-        self.received_rumors.append(value)
 
     def _consume_gossip_value(self) -> float:
         """Promedia los rumores recibidos y limpia el buffer."""
@@ -152,6 +148,19 @@ class AirQualityPublisher:
             },
         )
 
+        if self.peer.metrics:
+            self.peer.metrics.record_step(
+                domain="air",
+                commune=self.commune,
+                step=self.step,
+                objective_value=float(objective_value),
+                subjective_value=float(perception),
+                memory=self.perception_model.memory(self.commune),
+                gossip_value=gossip_value,
+                timestamp=timestamp,
+                metadata={"pollutant": self.pollutant, "sample_time": sample.time},
+            )
+
         self.step += 1
         return objective_value, perception
 
@@ -169,6 +178,9 @@ def main() -> int:
     parser.add_argument("--fanout", type=int, default=2)
     parser.add_argument("--pubsub-fanout", type=int, default=3)
     parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--runs-dir", default=None, help="Base directory for runs")
+    parser.add_argument("--run-id", default=None, help="Identifier for current run")
+    parser.add_argument("--topics", default="", help="Comma-separated topics to subscribe for rumors")
     args = parser.parse_args()
 
     config = ConfigLoader.load(args.config)
@@ -194,9 +206,18 @@ def main() -> int:
         fanout=args.fanout,
         pubsub_fanout=args.pubsub_fanout,
         seed=config.seed,
+        runs_dir=args.runs_dir,
+        run_id=args.run_id,
     )
 
-    peer.subscribe(args.commune)
+    if args.topics:
+        for t in args.topics.split(","):
+            t = t.strip()
+            if t:
+                peer.subscribe(t)
+    else:
+        peer.subscribe(args.commune, include_neighbors=True)
+
     peer.start()
 
     if args.seeds_file:

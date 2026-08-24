@@ -274,12 +274,14 @@ class PubSubEngine:
         config: PubSubConfig | None = None,
         topology: GeoTopology | None = None,
         seed: int | None = None,
+        metrics_collector: Any | None = None,
     ):
         self.self_peer = self_peer
         self.send_fn = send_fn
         self.config = config or PubSubConfig()
         self.topology = topology or GeoTopology()
         self.rng = random.Random(seed)
+        self.metrics = metrics_collector
 
         self.subscriptions = SubscriptionManager(self_peer.node_id)
         self.deduplicator = Deduplicator(
@@ -383,12 +385,30 @@ class PubSubEngine:
         # 1. Deduplicación: si ya se vio, no se procesa ni reenvía
         is_new = self.deduplicator.mark_seen(msg.msg_id)
         if not is_new:
+            if self.metrics:
+                self.metrics.record_drop(
+                    reason="duplicate",
+                    msg_id=msg.msg_id,
+                    topic=topic,
+                    channel=msg.payload.get("channel", ""),
+                )
             return (False, 0)
 
         # 2. Despacho local: Si el peer está suscrito al tópico, entregar a handlers
         delivered_locally = False
         if self.subscriptions.is_locally_subscribed(topic):
             delivered_locally = True
+            if self.metrics:
+                self.metrics.record_delivery(
+                    topic=topic,
+                    channel=msg.payload.get("channel", ""),
+                    value=msg.payload.get("value"),
+                    msg_id=msg.msg_id,
+                    sender_id=msg.sender_id,
+                    source_id=msg.payload.get("source_id"),
+                    hop_count=msg.hop_count,
+                    metadata=msg.payload.get("metadata", {}),
+                )
             for handler in self.message_handlers:
                 try:
                     handler(msg)
@@ -434,6 +454,24 @@ class PubSubEngine:
                 )
                 self.forward_queue.push(forward_msg, targets)
                 forwarded_count = self.flush_forward_queue()
+                if self.metrics:
+                    self.metrics.record_forward(
+                        topic=topic,
+                        channel=msg.payload.get("channel", ""),
+                        msg_id=msg.msg_id,
+                        targets_count=len(targets),
+                        remaining_ttl=forward_msg.ttl,
+                        hop_count=forward_msg.hop_count,
+                    )
+        elif not can_forward:
+            if self.metrics:
+                reason = "ttl_expired" if msg.ttl <= 0 else "filtered"
+                self.metrics.record_drop(
+                    reason=reason,
+                    msg_id=msg.msg_id,
+                    topic=topic,
+                    channel=msg.payload.get("channel", ""),
+                )
 
         return (delivered_locally, forwarded_count)
 

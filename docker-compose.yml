@@ -55,7 +55,7 @@ services:
     build: .
     container_name: civicmesh_publisher0
     hostname: publisher0
-    command: python -c "import time, sys; print('[publisher0] Publicador iniciado y conectado a la malla CivicMesh...', flush=True); time.sleep(3600)"
+    command: python -m domains.crime.publisher --node-id pub0 --host 0.0.0.0 --port 9500 --commune Santiago --seeds-file seeds_compose.txt --fanout 2 --pubsub-fanout 2 --runs-dir /app/runs --run-id compose-run
     depends_on:
       - peer0
       - peer1
@@ -70,9 +70,11 @@ services:
     build: .
     container_name: civicmesh_frontend
     hostname: frontend
-    command: python -c "import time, sys; print('[frontend] Servidor de estadísticas listo en puerto 8501...', flush=True); time.sleep(3600)"
+    command: streamlit run frontend/app.py --server.port 8501 --server.address 0.0.0.0
     ports:
       - "8501:8501"
+    environment:
+      - CIVICMESH_RUNS=/app/runs
     volumes:
       - civicmesh_runs:/app/runs
     networks:
