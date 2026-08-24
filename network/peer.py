@@ -26,6 +26,7 @@ from .messages import (
     CHANNEL_OBJECTIVE,
     CHANNEL_SUBJECTIVE,
 )
+from .metrics import MetricsCollector
 from .pubsub import PubSubEngine, PubSubConfig
 from .topology import GeoTopology
 
@@ -51,9 +52,17 @@ class Peer:
         suspect_timeout: float = 5.0,
         seed: int | None = None,
         topology: GeoTopology | None = None,
+        runs_dir: str | None = None,
+        run_id: str | None = None,
+        metrics_collector: MetricsCollector | None = None,
     ):
         # Inicializa un nodo de la red.
         self.info = PeerInfo(node_id=node_id, host=host, port=port)
+        self.metrics = (
+            metrics_collector
+            if metrics_collector is not None
+            else MetricsCollector(node_id=node_id, run_id=run_id, runs_dir=runs_dir)
+        )
         self.membership = Membership(
             self.info,
             MembershipConfig(
@@ -70,6 +79,7 @@ class Peer:
             config=PubSubConfig(pubsub_fanout=pubsub_fanout),
             topology=topology or GeoTopology(),
             seed=seed,
+            metrics_collector=self.metrics,
         )
         self.running = False
         self.server: socket.socket | None = None
@@ -128,6 +138,17 @@ class Peer:
 
         # Registrar en deduplicador propio
         self.pubsub.deduplicator.mark_seen(msg.msg_id)
+
+        # Registrar métrica de publicación
+        if self.metrics:
+            self.metrics.record_publish(
+                topic=topic,
+                channel=channel,
+                value=value,
+                msg_id=msg.msg_id,
+                timestamp=timestamp,
+                metadata=metadata,
+            )
 
         # Reenviar a peers según la política de fanout de pubsub
         candidates = list(self.membership.peers.values())
@@ -316,6 +337,11 @@ class Peer:
             if self.running:
                 sent = self.gossip.round()
                 changes = self.membership.run_failure_check()
+                if self.metrics:
+                    active = [p.node_id for p in self.membership.peers.values() if p.status == "alive"]
+                    suspect = [p.node_id for p in self.membership.peers.values() if p.status == "suspect"]
+                    failed = [p.node_id for p in self.membership.peers.values() if p.status == "failed"]
+                    self.metrics.record_gossip(active, suspect, failed, sent)
                 if sent or changes:
                     print(
                         f"[gossip] sent={sent} changes={changes} "
@@ -351,6 +377,8 @@ def main() -> int:
     parser.add_argument("--suspect-timeout", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--topics", default="", help="Comma separated list of initial topics/communes")
+    parser.add_argument("--runs-dir", default=None, help="Base directory for runs")
+    parser.add_argument("--run-id", default=None, help="Identifier for current run")
     args = parser.parse_args()
 
     peer = Peer(
@@ -362,6 +390,8 @@ def main() -> int:
         failure_timeout=args.failure_timeout,
         suspect_timeout=args.suspect_timeout,
         seed=args.seed,
+        runs_dir=args.runs_dir,
+        run_id=args.run_id,
     )
 
     if args.topics:
