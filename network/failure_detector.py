@@ -71,21 +71,22 @@ class FailureDetector:
 
             age = now - state.last_seen
 
-            if state.status == "alive" and age > self.timeout:
-
-                state.status = "suspect"
-
-                state.missed += 1
-
-                changed[node_id] = "suspect"
-
-            elif state.status == "suspect" and age > self.timeout + self.suspect_timeout:
+            # Se evalua primero el umbral mayor para permitir que un nodo inactivo por mucho tiempo pase directamente a "failed".
+            if state.status in ("alive", "suspect") and age > self.timeout + self.suspect_timeout:
 
                 state.status = "failed"
 
                 state.missed += 1
 
                 changed[node_id] = "failed"
+
+            elif state.status == "alive" and age > self.timeout:
+
+                state.status = "suspect"
+
+                state.missed += 1
+
+                changed[node_id] = "suspect"
 
         return changed
 
