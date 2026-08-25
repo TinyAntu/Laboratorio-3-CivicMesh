@@ -1,116 +1,351 @@
 #!/bin/bash
+
 #SBATCH --job-name=civicmesh
-#SBATCH --partition=GPU
-#SBATCH --nodes=4
-#SBATCH --ntasks=4
-#SBATCH --gres=gpu:A30:1
-#SBATCH --cpus-per-task=2
-#SBATCH --mem=64G
+#SBATCH --partition=batch
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=2
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=4G
 #SBATCH --time=00:30:00
 #SBATCH --output=civicmesh_%j.log
 #SBATCH --error=civicmesh_%j.err
 
-set -e
+#SBATCH hetjob
 
-# ==========================================
-# 1. Definicion de Directorio de Corrida
-# ==========================================
-RUN_ID="${SLURM_JOB_ID:-local-$(date +%s)}"
+#SBATCH --partition=GPU
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=8
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=16G
+#SBATCH --time=00:30:00
+
+set -uo pipefail
+
+# ------------------------------------------------------------------------------
+# Configuración general
+# ------------------------------------------------------------------------------
+PROJECT_ROOT="${CIVICMESH_PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
+cd "${PROJECT_ROOT}"
+export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
+
+RUN_ID="${SLURM_JOB_ID}"
+CPU_JOB_ID="${SLURM_JOB_ID_HET_GROUP_0:-${SLURM_JOB_ID}}"
+GPU_JOB_ID="${SLURM_JOB_ID_HET_GROUP_1:-}"
 BASE_RUNS_DIR="${CIVICMESH_RUNS:-$HOME/civicmesh_runs}"
 RUN_DIR="${BASE_RUNS_DIR}/${RUN_ID}"
-
-echo "[SLURM] Iniciando despliegue de CivicMesh. JOB_ID: ${RUN_ID}"
-echo "[SLURM] Directorio Shared FS: ${RUN_DIR}"
+RUN_CONFIG="${RUN_DIR}/config.yaml"
+HOSTFILE="${RUN_DIR}/hostfile.txt"
+PROCESS_REGISTRY="${RUN_DIR}/processes.tsv"
+DOMAIN="${CIVICMESH_DOMAIN:-both}"   # crime | air | both
 
 mkdir -p "${RUN_DIR}/metrics" "${RUN_DIR}/logs"
 
-# ==========================================
-# 2. Generacion de Config y Hostfile Inicial
-# ==========================================
-cat <<EOF > "${RUN_DIR}/config.yaml"
-experiment:
-  seed: 42
-  fanout: 2
-  ttl: 5
-  priority_channels:
-    objective: 10
-    subjective: 5
-comunas:
-  - Santiago
-  - Providencia
-  - Las Condes
-  - Maipu
-EOF
+if [[ ! -f "config/civicmesh.yaml" ]]; then
+    echo "[ERROR] No se encontró config/civicmesh.yaml desde ${PROJECT_ROOT}" >&2
+    exit 1
+fi
 
-touch "${RUN_DIR}/hostfile.txt"
+# La configuración efectiva de la corrida queda versionada en el shared FS.
+cp "config/civicmesh.yaml" "${RUN_CONFIG}"
 
-# Obtener lista de nodos asignados
-NODES=($(scontrol show hostnames $SLURM_JOB_NODELIST))
-echo "[SLURM] Nodos asignados: ${NODES[@]}"
+# ------------------------------------------------------------------------------
+# Validar allocation heterogénea: 2 CPU + 2 GPU
+# ------------------------------------------------------------------------------
+if [[ "${SLURM_HET_SIZE:-0}" -lt 2 ]]; then
+    echo "[ERROR] Este script requiere un heterogeneous job de Slurm (2 grupos)." >&2
+    echo "        Componente 0 = CPU, componente 1 = GPU." >&2
+    exit 1
+fi
 
-CPU_NODE_1=${NODES[0]:-localhost}
-CPU_NODE_2=${NODES[1]:-localhost}
-GPU_NODE_1=${NODES[2]:-localhost}
-GPU_NODE_2=${NODES[3]:-localhost}
+CPU_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0:-}"
+GPU_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_1:-}"
 
-# ==========================================
-# 3. Registro de Peers en hostfile.txt
-# ==========================================
-echo "p0 ${CPU_NODE_1} 9000" >> "${RUN_DIR}/hostfile.txt"
-echo "p1 ${CPU_NODE_1} 9001" >> "${RUN_DIR}/hostfile.txt"
-echo "p2 ${CPU_NODE_2} 9002" >> "${RUN_DIR}/hostfile.txt"
-echo "p3 ${CPU_NODE_2} 9003" >> "${RUN_DIR}/hostfile.txt"
+if [[ -z "${CPU_NODELIST}" || -z "${GPU_NODELIST}" ]]; then
+    echo "[ERROR] Slurm no expuso los node lists de ambos grupos heterogéneos." >&2
+    exit 1
+fi
 
-echo "[SLURM] Hostfile generado en ${RUN_DIR}/hostfile.txt:"
-cat "${RUN_DIR}/hostfile.txt"
+mapfile -t CPU_NODES < <(scontrol show hostnames "${CPU_NODELIST}")
+mapfile -t GPU_NODES < <(scontrol show hostnames "${GPU_NODELIST}")
 
-# ==========================================
-# 4. Lanzamiento de Peers en Nodos CPU
-# ==========================================
-echo "[SLURM] Arrancando Peers en Nodos CPU (${CPU_NODE_1}, ${CPU_NODE_2})..."
+if [[ ${#CPU_NODES[@]} -ne 2 || ${#GPU_NODES[@]} -ne 2 ]]; then
+    echo "[ERROR] Se esperaban exactamente 2 hosts CPU + 2 hosts GPU." >&2
+    echo "        CPU=${CPU_NODES[*]} GPU=${GPU_NODES[*]}" >&2
+    exit 1
+fi
 
-srun --nodelist=${CPU_NODE_1} --nodes=1 --ntasks=1 \
-    python -m network.peer --node-id p0 --host ${CPU_NODE_1} --port 9000 --fanout 2 --seed 42 --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}" \
-    > "${RUN_DIR}/logs/peer_p0.log" 2>&1 &
+CPU_NODE_1="${CPU_NODES[0]}"
+CPU_NODE_2="${CPU_NODES[1]}"
+GPU_NODE_1="${GPU_NODES[0]}"
+GPU_NODE_2="${GPU_NODES[1]}"
 
-srun --nodelist=${CPU_NODE_1} --nodes=1 --ntasks=1 \
-    python -m network.peer --node-id p1 --host ${CPU_NODE_1} --port 9001 --seeds-file "${RUN_DIR}/hostfile.txt" --fanout 2 --seed 43 --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}" \
-    > "${RUN_DIR}/logs/peer_p1.log" 2>&1 &
+cat > "${RUN_DIR}/allocation.txt" <<EOF_ALLOC
+run_id=${RUN_ID}
+project_root=${PROJECT_ROOT}
+domain=${DOMAIN}
+cpu_node_1=${CPU_NODE_1}
+cpu_node_2=${CPU_NODE_2}
+gpu_node_1=${GPU_NODE_1}
+gpu_node_2=${GPU_NODE_2}
+cpu_job_id=${CPU_JOB_ID}
+gpu_job_id=${GPU_JOB_ID}
+frontend=http://${GPU_NODE_2}:8501
+EOF_ALLOC
 
-srun --nodelist=${CPU_NODE_2} --nodes=1 --ntasks=1 \
-    python -m network.peer --node-id p2 --host ${CPU_NODE_2} --port 9002 --seeds-file "${RUN_DIR}/hostfile.txt" --fanout 2 --seed 44 --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}" \
-    > "${RUN_DIR}/logs/peer_p2.log" 2>&1 &
+printf '[SLURM] RUN_ID=%s\n' "${RUN_ID}"
+printf '[SLURM] Shared FS=%s\n' "${RUN_DIR}"
+printf '[SLURM] CPU hosts: %s %s (component job %s)\n' "${CPU_NODE_1}" "${CPU_NODE_2}" "${CPU_JOB_ID}"
+printf '[SLURM] GPU hosts (CPU only): %s %s (component job %s)\n' "${GPU_NODE_1}" "${GPU_NODE_2}" "${GPU_JOB_ID}"
 
-srun --nodelist=${CPU_NODE_2} --nodes=1 --ntasks=1 \
-    python -m network.peer --node-id p3 --host ${CPU_NODE_3:-${CPU_NODE_2}} --port 9003 --seeds-file "${RUN_DIR}/hostfile.txt" --fanout 2 --seed 45 --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}" \
-    > "${RUN_DIR}/logs/peer_p3.log" 2>&1 &
+# ------------------------------------------------------------------------------
+# Leer parámetros efectivos desde config.yaml
+# ------------------------------------------------------------------------------
+mapfile -t CFG_VALUES < <(python - "${RUN_CONFIG}" <<'PY'
+import sys
+import yaml
 
-# Esperar sincronizacion inicial de la malla
-sleep 5
+with open(sys.argv[1], encoding="utf-8") as fh:
+    cfg = yaml.safe_load(fh)
 
-# ==========================================
-# 5. Lanzamiento de Publicadores en Nodos GPU (solo CPU del host)
-# ==========================================
-echo "[SLURM] Arrancando Publicadores en Nodo GPU (${GPU_NODE_1})..."
+print(cfg.get("seed", 42))
+print(cfg["pubsub"]["objective"].get("fanout", 3))
+print(cfg["pubsub"]["subjective"].get("fanout", 2))
+print(cfg["pubsub"]["objective"].get("ttl", 3))
+print(cfg["pubsub"]["subjective"].get("ttl", 5))
+print(cfg["pubsub"]["objective"].get("priority", 80))
+print(cfg["pubsub"]["subjective"].get("priority", 50))
+PY
+)
 
-srun --nodelist=${GPU_NODE_1} --nodes=1 --ntasks=1 \
-    python -m domains.crime.publisher --node-id pub_crime --host ${GPU_NODE_1} --port 9500 --commune Santiago --seeds-file "${RUN_DIR}/hostfile.txt" --fanout 2 --pubsub-fanout 2 --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}" \
-    > "${RUN_DIR}/logs/publisher_domain_a.log" 2>&1 &
+SEED="${CFG_VALUES[0]}"
+FANOUT_OBJECTIVE="${CFG_VALUES[1]}"
+FANOUT_SUBJECTIVE="${CFG_VALUES[2]}"
+TTL_OBJECTIVE="${CFG_VALUES[3]}"
+TTL_SUBJECTIVE="${CFG_VALUES[4]}"
+PRIORITY_OBJECTIVE="${CFG_VALUES[5]}"
+PRIORITY_SUBJECTIVE="${CFG_VALUES[6]}"
+GOSSIP_FANOUT="${CIVICMESH_GOSSIP_FANOUT:-2}"
+MAX_VIEW_SIZE="${CIVICMESH_MAX_VIEW_SIZE:-8}"
+# Comunas disponibles en ambos dominios según config.
+mapfile -t COMMUNES < <(python - "${RUN_CONFIG}" <<'PY'
+import sys
+import yaml
 
-srun --nodelist=${GPU_NODE_1} --nodes=1 --ntasks=1 \
-    python -m domains.air.publisher --node-id pub_air --host ${GPU_NODE_1} --port 9501 --commune Santiago --seeds-file "${RUN_DIR}/hostfile.txt" --fanout 2 --pubsub-fanout 2 --loop --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}" \
-    > "${RUN_DIR}/logs/publisher_domain_b.log" 2>&1 &
+with open(sys.argv[1], encoding="utf-8") as fh:
+    cfg = yaml.safe_load(fh)
 
-# ==========================================
-# 6. Lanzamiento del Frontend UI en Nodo GPU (solo CPU del host)
-# ==========================================
-echo "[SLURM] Arrancando Frontend en Nodo GPU (${GPU_NODE_2})..."
+crime = set(cfg.get("crime", {}).get("rates", {}).keys())
+air = set(cfg.get("air", {}).get("datasets", {}).keys())
+for commune in sorted(crime & air):
+    print(commune)
+PY
+)
 
-CIVICMESH_RUNS="${BASE_RUNS_DIR}" srun --nodelist=${GPU_NODE_2} --nodes=1 --ntasks=1 \
-    streamlit run frontend/app.py --server.port 8501 --server.address 0.0.0.0 -- --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}" \
-    > "${RUN_DIR}/logs/frontend.log" 2>&1 &
+if [[ ${#COMMUNES[@]} -eq 0 ]]; then
+    echo "[ERROR] No existen comunas compartidas entre crime.rates y air.datasets." >&2
+    exit 1
+fi
 
-echo "[SLURM] CivicMesh desplegado correctamente."
-echo "[SLURM] Para tunel SSH al Frontend: ssh -L 8501:${GPU_NODE_2}:8501 usuario@cluster.diinf.usach.cl"
+# Lista CSV para el argumento --topics. El hostfile no incluye tópicos porque
+# su parser usa espacios como separador y comunas como "Las Condes" contienen
+# espacios; las suscripciones se anuncian por el protocolo Pub/Sub.
+TOPICS="$(IFS=,; echo "${COMMUNES[*]}")"
 
-wait
+# ------------------------------------------------------------------------------
+# Hostfile de los peers CPU
+# ------------------------------------------------------------------------------
+cat > "${HOSTFILE}" <<EOF_HOSTS
+p0 ${CPU_NODE_1} 9000
+p1 ${CPU_NODE_1} 9001
+p2 ${CPU_NODE_2} 9002
+p3 ${CPU_NODE_2} 9003
+EOF_HOSTS
+
+printf "name\thet_group\thost\tport\tlog\n" > "${PROCESS_REGISTRY}"
+
+# Mantener PIDs locales de los clientes srun para cleanup del batch.
+CHILDREN=()
+
+cleanup() {
+    local rc=$?
+    trap - EXIT INT TERM
+    echo "[SLURM] Finalizando pasos restantes..."
+    for pid in "${CHILDREN[@]:-}"; do
+        kill "${pid}" 2>/dev/null || true
+    done
+    exit "${rc}"
+}
+trap cleanup EXIT INT TERM
+
+launch_step() {
+    local name="$1"
+    local het_group="$2"
+    local host="$3"
+    local port="$4"
+    local logfile="$5"
+    shift 5
+
+    echo "[SLURM] launch ${name} group=${het_group} host=${host} port=${port}"
+    printf "%s\t%s\t%s\t%s\t%s\n" \
+        "${name}" "${het_group}" "${host}" "${port}" "${logfile}" \
+        >> "${PROCESS_REGISTRY}"
+
+    srun \
+        --het-group="${het_group}" \
+        --nodelist="${host}" \
+        --nodes=1 \
+        --ntasks=1 \
+        --cpus-per-task=1 \
+        --exact \
+        --job-name="${name}" \
+        "$@" \
+        > "${logfile}" 2>&1 &
+
+    CHILDREN+=("$!")
+}
+
+# ------------------------------------------------------------------------------
+# Peers: 2 procesos por cada host CPU
+# ------------------------------------------------------------------------------
+PEER_COMMON=(
+    --fanout "${GOSSIP_FANOUT}"
+    --max-view-size "${MAX_VIEW_SIZE}"
+    --pubsub-fanout-objective "${FANOUT_OBJECTIVE}"
+    --pubsub-fanout-subjective "${FANOUT_SUBJECTIVE}"
+    --ttl-objective "${TTL_OBJECTIVE}"
+    --ttl-subjective "${TTL_SUBJECTIVE}"
+    --priority-objective "${PRIORITY_OBJECTIVE}"
+    --priority-subjective "${PRIORITY_SUBJECTIVE}"
+    --topics "${TOPICS}"
+    --runs-dir "${BASE_RUNS_DIR}"
+    --run-id "${RUN_ID}"
+)
+
+launch_step "peer-p0" 0 "${CPU_NODE_1}" 9000 "${RUN_DIR}/logs/peer_p0.log" \
+    python -m network.peer --node-id p0 --host "${CPU_NODE_1}" --port 9000 \
+    --seed "$((SEED + 0))" "${PEER_COMMON[@]}"
+
+launch_step "peer-p1" 0 "${CPU_NODE_1}" 9001 "${RUN_DIR}/logs/peer_p1.log" \
+    python -m network.peer --node-id p1 --host "${CPU_NODE_1}" --port 9001 \
+    --seeds-file "${HOSTFILE}" --seed "$((SEED + 1))" "${PEER_COMMON[@]}"
+
+launch_step "peer-p2" 0 "${CPU_NODE_2}" 9002 "${RUN_DIR}/logs/peer_p2.log" \
+    python -m network.peer --node-id p2 --host "${CPU_NODE_2}" --port 9002 \
+    --seeds-file "${HOSTFILE}" --seed "$((SEED + 2))" "${PEER_COMMON[@]}"
+
+launch_step "peer-p3" 0 "${CPU_NODE_2}" 9003 "${RUN_DIR}/logs/peer_p3.log" \
+    python -m network.peer --node-id p3 --host "${CPU_NODE_2}" --port 9003 \
+    --seeds-file "${HOSTFILE}" --seed "$((SEED + 3))" "${PEER_COMMON[@]}"
+
+# Dar tiempo a que los sockets estén escuchando y se estabilice JOIN/Gossip.
+sleep "${CIVICMESH_BOOTSTRAP_SECONDS:-8}"
+
+# ------------------------------------------------------------------------------
+# Publishers: hosts GPU, pero explícitamente sin uso de CUDA/GPU.
+# Se levanta un publisher principal y una fuente subjective-only por comuna.
+# ------------------------------------------------------------------------------
+if [[ "${DOMAIN}" == "crime" || "${DOMAIN}" == "both" ]]; then
+    idx=0
+    for commune in "${COMMUNES[@]}"; do
+        slug="$(printf '%s' "${commune}" | tr '[:upper:] ' '[:lower:]_' | tr -cd '[:alnum:]_-')"
+        main_port=$((9500 + idx * 2))
+        rumor_port=$((main_port + 1))
+
+        launch_step "crime-${slug}" 1 "${GPU_NODE_1}" "${main_port}" \
+            "${RUN_DIR}/logs/crime_${slug}.log" \
+            env CUDA_VISIBLE_DEVICES="" python -m domains.crime.publisher \
+            --node-id "pub_crime_${slug}" --host "${GPU_NODE_1}" --port "${main_port}" \
+            --commune "${commune}" --config "${RUN_CONFIG}" \
+            --seeds-file "${HOSTFILE}" --topics "${commune}" \
+            --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}"
+
+        launch_step "crime-rumor-${slug}" 1 "${GPU_NODE_1}" "${rumor_port}" \
+            "${RUN_DIR}/logs/crime_rumor_${slug}.log" \
+            env CUDA_VISIBLE_DEVICES="" python -m domains.crime.publisher \
+            --node-id "rumor_crime_${slug}" --host "${GPU_NODE_1}" --port "${rumor_port}" \
+            --commune "${commune}" --config "${RUN_CONFIG}" \
+            --seeds-file "${HOSTFILE}" --topics "${commune}" --subjective-only \
+            --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}"
+
+        idx=$((idx + 1))
+    done
+fi
+
+if [[ "${DOMAIN}" == "air" || "${DOMAIN}" == "both" ]]; then
+    idx=0
+    for commune in "${COMMUNES[@]}"; do
+        slug="$(printf '%s' "${commune}" | tr '[:upper:] ' '[:lower:]_' | tr -cd '[:alnum:]_-')"
+        main_port=$((9600 + idx * 2))
+        rumor_port=$((main_port + 1))
+
+        launch_step "air-${slug}" 1 "${GPU_NODE_2}" "${main_port}" \
+            "${RUN_DIR}/logs/air_${slug}.log" \
+            env CUDA_VISIBLE_DEVICES="" python -m domains.air.publisher \
+            --node-id "pub_air_${slug}" --host "${GPU_NODE_2}" --port "${main_port}" \
+            --commune "${commune}" --config "${RUN_CONFIG}" \
+            --seeds-file "${HOSTFILE}" --topics "${commune}" --loop \
+            --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}"
+
+        launch_step "air-rumor-${slug}" 1 "${GPU_NODE_2}" "${rumor_port}" \
+            "${RUN_DIR}/logs/air_rumor_${slug}.log" \
+            env CUDA_VISIBLE_DEVICES="" python -m domains.air.publisher \
+            --node-id "rumor_air_${slug}" --host "${GPU_NODE_2}" --port "${rumor_port}" \
+            --commune "${commune}" --config "${RUN_CONFIG}" \
+            --seeds-file "${HOSTFILE}" --topics "${commune}" --subjective-only --loop \
+            --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}"
+
+        idx=$((idx + 1))
+    done
+fi
+
+# ------------------------------------------------------------------------------
+# Frontend en segundo host GPU, también solo CPU del host.
+# ------------------------------------------------------------------------------
+launch_step "frontend" 1 "${GPU_NODE_2}" 8501 "${RUN_DIR}/logs/frontend.log" \
+    env CUDA_VISIBLE_DEVICES="" CIVICMESH_RUNS="${BASE_RUNS_DIR}" \
+    streamlit run frontend/app.py \
+    --server.port 8501 \
+    --server.address 0.0.0.0 \
+    --server.headless true
+
+cat > "${RUN_DIR}/frontend.txt" <<EOF_FRONTEND
+Frontend node: ${GPU_NODE_2}
+Frontend port: 8501
+SSH tunnel (ajustar login del DIINF):
+ssh -L 8501:${GPU_NODE_2}:8501 <usuario>@<login-diinf>
+EOF_FRONTEND
+
+# ------------------------------------------------------------------------------
+# Experimento de caída opcional automático.
+# Ejemplo:
+# CIVICMESH_FAILURE_AFTER=60 CIVICMESH_FAILURE_PEER=p1 sbatch run_civicmesh.sbatch
+# ------------------------------------------------------------------------------
+if [[ -n "${CIVICMESH_FAILURE_AFTER:-}" ]]; then
+    (
+        sleep "${CIVICMESH_FAILURE_AFTER}"
+        "${PROJECT_ROOT}/scripts/slurm/partition_experiment.sh" \
+            "${RUN_ID}" "${CIVICMESH_FAILURE_PEER:-p1}"
+    ) > "${RUN_DIR}/logs/failure_controller.log" 2>&1 &
+    CHILDREN+=("$!")
+fi
+
+cat <<EOF_READY
+========================================================================
+[SLURM] CivicMesh desplegado
+RUN_ID:      ${RUN_ID}
+CPU peers:   ${CPU_NODE_1}, ${CPU_NODE_2}
+GPU hosts:   ${GPU_NODE_1}, ${GPU_NODE_2} (CPU only)
+Config:      ${RUN_CONFIG}
+Hostfile:    ${HOSTFILE}
+Metrics:     ${RUN_DIR}/metrics
+Logs:        ${RUN_DIR}/logs
+Frontend:    http://${GPU_NODE_2}:8501
+
+Caída manual de un peer:
+  scripts/slurm/partition_experiment.sh ${RUN_ID} p1
+========================================================================
+EOF_READY
+
+# Los procesos principales son de larga duración. Una caída intencional de un
+# peer hará terminar un srun con código != 0, pero NO debe abortar toda la corrida.
+wait || true

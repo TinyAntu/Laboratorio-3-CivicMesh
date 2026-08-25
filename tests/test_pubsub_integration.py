@@ -49,6 +49,12 @@ def test_pubsub_three_peers_end_to_end():
         assert msg.payload["channel"] == CHANNEL_OBJECTIVE
         assert msg.payload["value"] == {"delitos": 5}
 
+        # El suscriptor también debe reflejar el valor en su estado agregado local.
+        state_entry = p3.state.get("Santiago", CHANNEL_OBJECTIVE, "value")
+        assert state_entry is not None
+        assert state_entry.value == {"delitos": 5}
+        assert state_entry.source_id == "p1"
+
     finally:
         p1.stop()
         p2.stop()

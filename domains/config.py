@@ -14,6 +14,19 @@ class SimulationConfig:
 
 
 @dataclass(frozen=True)
+class PubSubChannelConfig:
+    fanout: int
+    ttl: int
+    priority: int
+
+
+@dataclass(frozen=True)
+class PubSubRuntimeConfig:
+    objective: PubSubChannelConfig
+    subjective: PubSubChannelConfig
+
+
+@dataclass(frozen=True)
 class CrimeConfig:
     rates: dict[str, dict[str, float]]
 
@@ -47,6 +60,7 @@ class AirPerceptionConfig:
 class DataConfig:
     seed: int
     simulation: SimulationConfig
+    pubsub: PubSubRuntimeConfig
     crime: CrimeConfig
     crime_perception: CrimePerceptionConfig
     air: AirConfig
@@ -61,6 +75,7 @@ class ConfigLoader:
             raw: dict[str, Any] = yaml.safe_load(fh)
 
         simulation = raw["simulation"]
+        pubsub = raw["pubsub"]
         crime_perception = raw["crime_perception"]
         air_perception = raw["air_perception"]
 
@@ -69,6 +84,18 @@ class ConfigLoader:
             simulation=SimulationConfig(
                 delta_t=float(simulation["delta_t"]),
                 interval_seconds=float(simulation["interval_seconds"]),
+            ),
+            pubsub=PubSubRuntimeConfig(
+                objective=PubSubChannelConfig(
+                    fanout=int(pubsub["objective"]["fanout"]),
+                    ttl=int(pubsub["objective"]["ttl"]),
+                    priority=int(pubsub["objective"]["priority"]),
+                ),
+                subjective=PubSubChannelConfig(
+                    fanout=int(pubsub["subjective"]["fanout"]),
+                    ttl=int(pubsub["subjective"]["ttl"]),
+                    priority=int(pubsub["subjective"]["priority"]),
+                ),
             ),
             crime=CrimeConfig(
                 rates={
@@ -111,6 +138,23 @@ class ConfigLoader:
             raise ValueError("simulation.delta_t debe ser mayor que 0")
         if config.simulation.interval_seconds < 0:
             raise ValueError("simulation.interval_seconds no puede ser negativo")
+
+        for channel_name, channel in (
+            ("objective", config.pubsub.objective),
+            ("subjective", config.pubsub.subjective),
+        ):
+            if channel.fanout <= 0:
+                raise ValueError(
+                    f"pubsub.{channel_name}.fanout debe ser mayor que 0"
+                )
+            if channel.ttl <= 0:
+                raise ValueError(
+                    f"pubsub.{channel_name}.ttl debe ser mayor que 0"
+                )
+            if channel.priority < 0:
+                raise ValueError(
+                    f"pubsub.{channel_name}.priority no puede ser negativa"
+                )
 
         if not 0 < config.crime_perception.alpha < 1:
             raise ValueError("crime_perception.alpha debe estar en (0, 1)")
