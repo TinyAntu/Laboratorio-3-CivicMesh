@@ -10,9 +10,7 @@ from .failure_detector import FailureDetector
 
 @dataclass
 class MembershipConfig:
-    """
-    Configuración del sistema de membresía.
-    """
+    """Configuración del sistema de membresía."""
 
     # Cantidad máxima de peers contactados en cada ronda Gossip.
     gossip_fanout: int = 2
@@ -29,17 +27,11 @@ class MembershipConfig:
 
 class Membership:
     """
-    Vista parcial de membresía con Gossip periódico
-    y detección de fallos por timeout.
+    Vista parcial de membresía con Gossip periódico y detección de fallos.
 
-    La vista local está limitada por max_view_size.
-
-    Si llega un peer nuevo cuando la vista está llena:
-      1. se prioriza reemplazar peers suspect/failed;
-      2. si todos están alive, se reemplaza uno al azar.
-
-    El gossip_fanout es independiente del tamaño de la vista:
-    determina cuántos peers activos son contactados en cada ronda.
+    La vista local está limitada por ``max_view_size``. El estado de liveness
+    se conserva aunque un peer salga temporalmente de la vista parcial, para
+    evitar que Gossip indirecto reinicie su timeout al reaprenderlo.
     """
 
     def __init__(
@@ -52,16 +44,24 @@ class Membership:
         self.config = config or MembershipConfig()
 
         if self.config.gossip_fanout <= 0:
-            raise ValueError(
-                "gossip_fanout debe ser mayor que 0"
-            )
+            raise ValueError("gossip_fanout debe ser mayor que 0")
 
         if self.config.max_view_size <= 0:
-            raise ValueError(
-                "max_view_size debe ser mayor que 0"
-            )
+            raise ValueError("max_view_size debe ser mayor que 0")
 
+        # Vista parcial activa usada para seleccionar destinos Gossip/PubSub.
         self.peers: dict[str, PeerInfo] = {}
+
+        # Historial ligero separado de la vista parcial. Conserva la última
+        # incarnation y metadatos conocidos aunque un peer sea expulsado de la
+        # vista por max_view_size.
+        self._known_peers: dict[str, PeerInfo] = {}
+
+        # Peers de bootstrap configurados explícitamente (seeds). Se mantienen
+        # preferentemente en la vista para que la detección de fallos de los
+        # peers estructurales no dependa de la rotación aleatoria causada por
+        # publishers u otros participantes Gossip.
+        self._persistent_peers: set[str] = set()
 
         self.failure_detector = FailureDetector(
             timeout=self.config.failure_timeout,
@@ -70,51 +70,63 @@ class Membership:
 
         self.rng = random.Random(seed)
 
+    def _remember_peer(self, peer: PeerInfo) -> None:
+        """Conserva la metadata/incarnation más reciente conocida."""
+        current = self._known_peers.get(peer.node_id)
+        if current is None or peer.incarnation >= current.incarnation:
+            self._known_peers[peer.node_id] = PeerInfo.from_dict(peer.to_dict())
+
     def _remove_peer(self, node_id: str) -> None:
         """
-        Elimina un peer tanto de la vista local como
-        del detector de fallos.
-        """
+        Elimina un peer de la vista parcial, pero conserva su historial de
+        liveness/incarnation.
 
-        self.peers.pop(node_id, None)
-        self.failure_detector.remove(node_id)
+        Esto evita que una mención Gossip stale lo vuelva a introducir como si
+        fuera completamente nuevo y reinicie el detector de fallos.
+        """
+        peer = self.peers.pop(node_id, None)
+        if peer is not None:
+            self._remember_peer(peer)
+
+            # Un peer fuera de la vista parcial deja de estar bajo
+            # monitorización activa. Mantener su reloj corriendo mientras no
+            # puede ser elegido/probado produciría falsos positivos. El
+            # historial de incarnation/status se conserva en _known_peers.
+            self.failure_detector.remove(node_id)
 
     def _select_eviction_candidate(self) -> str | None:
-        """
-        Selecciona un peer para expulsar cuando la vista
-        parcial está llena.
+        """Selecciona qué peer expulsar cuando la vista está llena.
 
-        Se priorizan peers que no estén alive.
-        Si todos están activos, se escoge uno al azar.
+        Los seeds persistentes se conservan siempre que exista algún miembro
+        no persistente que pueda rotar. Así la vista sigue siendo acotada y
+        parcial, pero los peers estructurales permanecen monitorizables.
         """
-
         if not self.peers:
             return None
 
+        rotatable = [
+            peer
+            for peer in self.peers.values()
+            if peer.node_id not in self._persistent_peers
+        ]
+        pool = rotatable if rotatable else list(self.peers.values())
+
         non_alive = [
             peer.node_id
-            for peer in self.peers.values()
+            for peer in pool
             if peer.status != "alive"
         ]
 
         if non_alive:
             return self.rng.choice(non_alive)
 
-        return self.rng.choice(
-            list(self.peers.keys())
-        )
+        return self.rng.choice([peer.node_id for peer in pool])
 
     def _make_room_for_new_peer(self) -> None:
-        """
-        Libera una posición cuando la vista alcanzó
-        max_view_size.
-        """
-
         if len(self.peers) < self.config.max_view_size:
             return
 
         candidate = self._select_eviction_candidate()
-
         if candidate is not None:
             self._remove_peer(candidate)
 
@@ -122,87 +134,37 @@ class Membership:
         self,
         peer: PeerInfo,
         now: float | None = None,
+        persistent: bool = False,
     ) -> bool:
         """
-        Agrega un peer nuevo o actualiza uno existente.
+        Agrega o actualiza un peer usando evidencia DIRECTA.
 
-        Un peer conocido solamente puede actualizarse si:
-
-          - posee una incarnation mayor, o
-          - posee la misma incarnation y actualmente está alive.
-
-        Esto evita que información Gossip atrasada con la misma
-        incarnation reactive accidentalmente un peer que ya fue
-        marcado suspect o failed.
-
-        La vista nunca supera max_view_size.
+        Este método se usa para JOIN/seeds. Una comunicación directa puede
+        recuperar un peer con la misma incarnation después de una partición
+        temporal; una incarnation menor siempre se rechaza.
         """
-
         if peer.node_id == self.self_peer.node_id:
             return False
 
-        now = (
-            time.monotonic()
-            if now is None
-            else now
-        )
+        if persistent:
+            self._persistent_peers.add(peer.node_id)
 
+        now = time.monotonic() if now is None else now
         current = self.peers.get(peer.node_id)
+        known = self._known_peers.get(peer.node_id)
+        reference = current or known
 
-        # ---------------------------------------------------------
-        # Peer ya conocido.
-        #
-        # IMPORTANTE:
-        # Esta es la lógica proveniente del fix de tus compañeros.
-        #
-        # Una misma incarnation solamente puede refrescar a un peer
-        # que aún está alive. Si está suspect/failed, un dato Gossip
-        # antiguo no debe resucitarlo.
-        #
-        # Una incarnation mayor sí representa información nueva.
-        # ---------------------------------------------------------
-        if current is not None:
-            valid_update = (
-                peer.incarnation > current.incarnation
-                or (
-                    peer.incarnation == current.incarnation
-                    and current.status == "alive"
-                )
-            )
+        if reference is not None and peer.incarnation < reference.incarnation:
+            return False
 
-            if not valid_update:
-                return False
-
-            peer.last_seen = now
-            peer.status = "alive"
-
-            self.peers[peer.node_id] = peer
-
-            self.failure_detector.observe(
-                peer.node_id,
-                now,
-            )
-
-            return True
-
-        # ---------------------------------------------------------
-        # Peer nuevo.
-        #
-        # Si la vista parcial está llena, se libera primero una
-        # posición según la política definida.
-        # ---------------------------------------------------------
-        self._make_room_for_new_peer()
+        if current is None:
+            self._make_room_for_new_peer()
 
         peer.last_seen = now
         peer.status = "alive"
-
         self.peers[peer.node_id] = peer
-
-        self.failure_detector.observe(
-            peer.node_id,
-            now,
-        )
-
+        self._remember_peer(peer)
+        self.failure_detector.observe(peer.node_id, now)
         return True
 
     def mark_seen(
@@ -211,39 +173,38 @@ class Membership:
         now: float | None = None,
     ) -> None:
         """
-        Registra una señal de vida directa de un peer conocido.
+        Registra una señal de vida DIRECTA.
+
+        Si el peer había sido expulsado de la vista parcial, puede restaurarse
+        desde el historial conocido sin perder su metadata.
         """
-
-        now = (
-            time.monotonic()
-            if now is None
-            else now
-        )
-
+        now = time.monotonic() if now is None else now
         peer = self.peers.get(node_id)
 
         if peer is None:
-            return
+            known = self._known_peers.get(node_id)
+            if known is None:
+                return
+
+            self._make_room_for_new_peer()
+            peer = PeerInfo.from_dict(known.to_dict())
+            self.peers[node_id] = peer
 
         peer.last_seen = now
         peer.status = "alive"
-
-        self.failure_detector.observe(
-            node_id,
-            now,
-        )
+        self._remember_peer(peer)
+        self.failure_detector.observe(node_id, now)
 
     def remove_failed(self) -> list[str]:
         """
-        Elimina de la vista los peers actualmente marcados
-        como failed.
-        """
+        Quita peers failed de la vista activa pero conserva su tombstone local.
 
+        Una misma incarnation no puede reaparecer solo por Gossip indirecto;
+        una señal directa o una incarnation mayor sí pueden recuperarla.
+        """
         removed: list[str] = []
 
-        for node_id, peer in list(
-            self.peers.items()
-        ):
+        for node_id, peer in list(self.peers.items()):
             if peer.status == "failed":
                 removed.append(node_id)
                 self._remove_peer(node_id)
@@ -254,16 +215,8 @@ class Membership:
         self,
         fanout: int | None = None,
     ) -> list[PeerInfo]:
-        """
-        Selecciona aleatoriamente hasta fanout peers activos
-        desde la vista parcial local.
-        """
-
-        fanout = (
-            self.config.gossip_fanout
-            if fanout is None
-            else fanout
-        )
+        """Selecciona hasta ``fanout`` peers alive de la vista parcial."""
+        fanout = self.config.gossip_fanout if fanout is None else fanout
 
         candidates = [
             peer
@@ -274,44 +227,115 @@ class Membership:
         if not candidates:
             return []
 
-        return self.rng.sample(
-            candidates,
-            min(fanout, len(candidates)),
-        )
+        return self.rng.sample(candidates, min(fanout, len(candidates)))
+
+    def _merge_indirect_peer(
+        self,
+        peer: PeerInfo,
+        now: float,
+    ) -> bool:
+        """
+        Integra información aprendida INDIRECTAMENTE por Gossip.
+
+        Regla central: una mención de ``pX`` enviada por ``pY`` NO es un
+        heartbeat de ``pX``. Para la misma incarnation se actualizan solo
+        metadatos; ``last_seen`` y status permanecen bajo control local.
+        """
+        if peer.node_id == self.self_peer.node_id:
+            return False
+
+        current = self.peers.get(peer.node_id)
+        known = self._known_peers.get(peer.node_id)
+        reference = current or known
+
+        # Primer descubrimiento indirecto: comienza una observación local. Si
+        # nunca hay contacto directo, expirará normalmente por timeout.
+        if reference is None:
+            self._make_room_for_new_peer()
+            peer.last_seen = now
+            peer.status = "alive"
+            self.peers[peer.node_id] = peer
+            self._remember_peer(peer)
+            self.failure_detector.observe(peer.node_id, now)
+            return True
+
+        if peer.incarnation < reference.incarnation:
+            return False
+
+        # Una incarnation mayor representa un reinicio/nueva versión del peer.
+        if peer.incarnation > reference.incarnation:
+            if current is None:
+                self._make_room_for_new_peer()
+
+            peer.last_seen = now
+            peer.status = "alive"
+            self.peers[peer.node_id] = peer
+            self._remember_peer(peer)
+            self.failure_detector.observe(peer.node_id, now)
+            return True
+
+        # Misma incarnation: actualizar metadatos sin tocar liveness.
+        updated = PeerInfo.from_dict(reference.to_dict())
+        changed = False
+
+        if updated.host != peer.host:
+            updated.host = peer.host
+            changed = True
+        if updated.port != peer.port:
+            updated.port = peer.port
+            changed = True
+        if updated.topics != peer.topics:
+            updated.topics = list(peer.topics)
+            changed = True
+
+        self._remember_peer(updated)
+
+        # Si había salido de la vista, puede reingresar como miembro activo.
+        # El tiempo pasado fuera de la vista NO cuenta para failure_timeout,
+        # porque durante ese período este nodo no estaba siendo monitorizado.
+        # La misma incarnation marcada previamente como failed permanece como
+        # tombstone y no puede revivir por una mención indirecta.
+        if current is None:
+            if reference.status == "failed":
+                return False
+
+            self._make_room_for_new_peer()
+            updated.last_seen = now
+            updated.status = "alive"
+            self.peers[peer.node_id] = updated
+
+            # Comienza una nueva ventana de monitorización. Esto no convierte
+            # Gossip en heartbeat: mientras permanezca en la vista, nuevas
+            # menciones indirectas no refrescarán este reloj. Peer realizará
+            # PING directo periódico para aportar evidencia real de liveness.
+            self.failure_detector.observe(peer.node_id, now)
+            self._remember_peer(updated)
+            return True
+
+        # Si sigue en la vista, conservar status/last_seen locales.
+        current.host = updated.host
+        current.port = updated.port
+        current.topics = list(updated.topics)
+        return changed
 
     def merge(
         self,
         remote_peers: list[dict],
         now: float | None = None,
     ) -> int:
-        """
-        Integra una vista recibida mediante Gossip.
-
-        add_peer() aplica tanto las reglas de incarnation/status
-        como el límite max_view_size.
-        """
-
+        """Integra una vista Gossip sin convertir terceros en heartbeats."""
+        now = time.monotonic() if now is None else now
         changed = 0
 
         for raw in remote_peers:
             peer = PeerInfo.from_dict(raw)
-
-            if self.add_peer(
-                peer,
-                now=now,
-            ):
+            if self._merge_indirect_peer(peer, now):
                 changed += 1
 
         return changed
 
     def gossip_view(self) -> list[dict]:
-        """
-        Construye la vista que será compartida durante Gossip.
-
-        Como self.peers ya está limitado por max_view_size,
-        lo enviado sigue representando una vista parcial.
-        """
-
+        """Construye la vista parcial propagada por Gossip."""
         return [
             peer.to_dict()
             for peer in self.peers.values()
@@ -322,41 +346,27 @@ class Membership:
         self,
         now: float | None = None,
     ) -> dict[str, str]:
-        """
-        Ejecuta el detector de fallos y sincroniza los cambios
-        de estado con la vista de Membership.
-        """
-
-        changes = self.failure_detector.check(
-            now=now
-        )
+        """Ejecuta el detector y sincroniza cambios con la vista activa."""
+        changes = self.failure_detector.check(now=now)
 
         for node_id, status in changes.items():
             if node_id in self.peers:
                 self.peers[node_id].status = status
+                self._remember_peer(self.peers[node_id])
+            elif node_id in self._known_peers:
+                self._known_peers[node_id].status = status
 
         return changes
 
     def snapshot(self) -> dict:
-        """
-        Retorna una representación del estado actual
-        de membresía.
-        """
-
+        """Retorna una representación del estado actual de membresía."""
         return {
             "self": self.self_peer.to_dict(),
-
-            "max_view_size": (
-                self.config.max_view_size
-            ),
-
+            "max_view_size": self.config.max_view_size,
+            "persistent_peers": sorted(self._persistent_peers),
             "peers": {
                 node_id: peer.to_dict()
-                for node_id, peer
-                in self.peers.items()
+                for node_id, peer in self.peers.items()
             },
-
-            "failure_detector": (
-                self.failure_detector.snapshot()
-            ),
+            "failure_detector": self.failure_detector.snapshot(),
         }

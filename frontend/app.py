@@ -66,6 +66,7 @@ publish_events = [r for r in records if r.get("event") == "publish"]
 delivery_events = [r for r in records if r.get("event") == "delivery"]
 drop_events = [r for r in records if r.get("event") == "drop"]
 gossip_events = [r for r in records if r.get("event") == "gossip"]
+membership_events = [r for r in records if r.get("event") == "membership_change"]
 
 detected_domains = list(set(r.get("domain") for r in step_events if "domain" in r))
 current_domain = detected_domains[0] if detected_domains else "General"
@@ -263,6 +264,11 @@ with tab_network:
                 "Mensajes": [hops_counts[k] for k in sorted(hops_counts.keys())],
             }
             st.bar_chart(hops_data, x="Saltos (Hops)", y="Mensajes")
+
+    if membership_events:
+        st.markdown("#### Transiciones de Membresía Detectadas")
+        latest_membership = membership_events[-20:]
+        st.dataframe(latest_membership, use_container_width=True)
 
     if gossip_events:
         st.markdown("#### Detección de Fallos y Vistas Gossip")

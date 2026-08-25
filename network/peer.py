@@ -1,5 +1,6 @@
 from __future__ import annotations
 import argparse
+from concurrent.futures import ThreadPoolExecutor, wait
 import json
 import socket
 import threading
@@ -63,6 +64,8 @@ class Peer:
         runs_dir: str | None = None,
         run_id: str | None = None,
         metrics_collector: MetricsCollector | None = None,
+        control_timeout: float = 0.75,
+        listen_backlog: int = 512,
     ):
         # Inicializa un nodo de la red.
         self.info = PeerInfo(node_id=node_id, host=host, port=port)
@@ -81,7 +84,23 @@ class Peer:
             ),
             seed=seed,
         )
-        self.gossip = Gossip(self.membership, self._send_peer)
+        # El plano de control (Gossip/liveness) usa un timeout corto e
+        # independiente del tráfico Pub/Sub. Así una ráfaga de publicaciones o
+        # varios destinos lentos no pueden bloquear una ronda de membresía por
+        # decenas de segundos.
+        self.control_timeout = max(0.05, float(control_timeout))
+        self.listen_backlog = max(64, int(listen_backlog))
+        # El detector dispone de varias oportunidades de probe antes de
+        # failure_timeout y corre en un hilo independiente de Gossip.
+        self.liveness_interval = min(
+            1.0,
+            max(0.20, float(failure_timeout) / 3.0),
+        )
+        self._liveness_executor = ThreadPoolExecutor(
+            max_workers=max(1, max_view_size),
+            thread_name_prefix=f"{node_id}-liveness",
+        )
+        self.gossip = Gossip(self.membership, self._send_control_peer)
 
         # Compatibilidad: --pubsub-fanout sigue pudiendo fijar un valor común,
         # pero los valores por canal tienen precedencia si se entregan.
@@ -156,13 +175,110 @@ class Peer:
         """Retorna una copia del estado agregado local de un tópico."""
         return self.state.topic_state(topic)
 
-    # Envia un mensaje a un nodo especifico.
+    # Envia un mensaje de datos a un nodo especifico.
     def _send_peer(self, peer: PeerInfo, message: Message) -> None:
         send_json(peer.host, peer.port, message)
+
+        # Una conexión TCP exitosa con el destino es evidencia directa de que
+        # ese peer está vivo. A diferencia de una mención indirecta en Gossip,
+        # este evento sí puede refrescar el detector de fallos.
+        self.membership.mark_seen(peer.node_id)
+
+    def _send_control_peer(self, peer: PeerInfo, message: Message) -> None:
+        """Envía tráfico del plano de control con un timeout acotado.
+
+        Pub/Sub conserva el timeout de transporte normal, pero membresía no
+        debe quedar detenida varios segundos por cada vecino lento.
+        """
+        send_json(
+            peer.host,
+            peer.port,
+            message,
+            timeout=self.control_timeout,
+        )
+        self.membership.mark_seen(peer.node_id)
+
+    def _probe_target(self, target: PeerInfo, ping: Message) -> bool:
+        """Realiza un probe sin mutar Membership desde el worker."""
+        try:
+            send_json(
+                target.host,
+                target.port,
+                ping,
+                timeout=self.control_timeout,
+            )
+            return True
+        except OSError:
+            return False
 
     # Enviar un mensaje a otro nodo.
     def send(self, peer: PeerInfo, message: Message) -> None:
         self._send_peer(peer, message)
+
+    def _probe_membership_liveness(self) -> int:
+        """Comprueba en paralelo los miembros activos de la vista parcial.
+
+        La implementación anterior hacía hasta ``max_view_size`` conexiones
+        secuenciales. Con 8 vecinos y timeouts de red, una sola ronda podía
+        bloquear el hilo de Gossip durante muchos segundos. Los probes ahora
+        comparten un presupuesto temporal corto y se ejecutan en paralelo.
+
+        Solo el hilo coordinador actualiza Membership después de cada éxito;
+        los workers de red no modifican la vista concurrentemente.
+        """
+        candidates = [
+            PeerInfo.from_dict(peer.to_dict())
+            for peer in list(self.membership.peers.values())
+            if peer.status in ("alive", "suspect")
+        ]
+
+        if not candidates:
+            return 0
+
+        futures = {}
+        for target in candidates:
+            ping = Message(
+                type=MSG_PING,
+                sender_id=self.info.node_id,
+                msg_id=(
+                    f"ping-{self.info.node_id}-{target.node_id}-"
+                    f"{time.time_ns()}"
+                ),
+                payload={"node_id": self.info.node_id},
+                ttl=1,
+                priority=100,
+            )
+            future = self._liveness_executor.submit(
+                self._probe_target,
+                target,
+                ping,
+            )
+            futures[future] = target.node_id
+
+        # Cada socket ya tiene control_timeout. El wait global añade solo un
+        # margen pequeño y evita volver a convertir la ronda en una espera
+        # secuencial por vecino.
+        done, pending = wait(
+            futures,
+            timeout=self.control_timeout + 0.20,
+        )
+
+        probed = 0
+        for future in done:
+            node_id = futures[future]
+            try:
+                success = future.result()
+            except Exception:
+                success = False
+
+            if success:
+                self.membership.mark_seen(node_id)
+                probed += 1
+
+        for future in pending:
+            future.cancel()
+
+        return probed
 
     # --- Métodos de la Capa Pub/Sub ---
 
@@ -251,7 +367,7 @@ class Peer:
             if seed.node_id == self.info.node_id:
                 continue
 
-            self.membership.add_peer(seed)
+            self.membership.add_peer(seed, persistent=True)
             if seed.topics:
                 self.pubsub.subscriptions.update_peer_topics(seed.node_id, seed.topics)
 
@@ -274,10 +390,25 @@ class Peer:
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server.bind((self.info.host, self.info.port))
-        self.server.listen(64)
+        # Un backlog más amplio evita que ráfagas Pub/Sub llenen la cola del
+        # socket y hagan fallar conexiones cortas de PING/Gossip.
+        self.server.listen(self.listen_backlog)
         self.running = True
-        threading.Thread(target=self._serve_loop, daemon=True).start()
-        threading.Thread(target=self._gossip_loop, daemon=True).start()
+        threading.Thread(
+            target=self._serve_loop,
+            daemon=True,
+            name=f"{self.info.node_id}-server",
+        ).start()
+        threading.Thread(
+            target=self._liveness_loop,
+            daemon=True,
+            name=f"{self.info.node_id}-liveness",
+        ).start()
+        threading.Thread(
+            target=self._gossip_loop,
+            daemon=True,
+            name=f"{self.info.node_id}-gossip",
+        ).start()
 
         print(
             f"[peer] node={self.info.node_id} "
@@ -298,6 +429,8 @@ class Peer:
                 self.server.close()
             except OSError:
                 pass
+        # No esperamos workers de red pendientes al apagar el proceso.
+        self._liveness_executor.shutdown(wait=False, cancel_futures=True)
 
     # Mantiene el servidor esperando conexiones.
     def _serve_loop(self) -> None:
@@ -328,6 +461,12 @@ class Peer:
             line, _, _ = buffer.partition(b"\n")
             message = Message.from_dict(json.loads(line.decode()))
 
+            # Cualquier mensaje recibido directamente desde un peer conocido
+            # constituye una señal de vida válida de SU emisor. Esto no afecta
+            # a terceros mencionados dentro de un mensaje Gossip.
+            if message.type != MSG_JOIN:
+                self.membership.mark_seen(message.sender_id)
+
             if message.type == MSG_JOIN:
                 peer = PeerInfo.from_dict(message.payload["peer"])
                 self.membership.add_peer(peer)
@@ -336,11 +475,9 @@ class Peer:
                 self._reply(conn, MSG_JOIN_ACK, {"members": self.membership.gossip_view()})
 
             elif message.type == MSG_PING:
-                self.membership.mark_seen(message.sender_id)
                 self._reply(conn, MSG_PONG, {"node_id": self.info.node_id})
 
             elif message.type == MSG_MEMBERSHIP_GOSSIP:
-                self.membership.mark_seen(message.sender_id)
                 self.gossip.handle(message)
                 # Sincronizar topics aprendidos
                 for m in message.payload.get("members", []):
@@ -405,23 +542,74 @@ class Peer:
         )
         conn.sendall(msg.encode())
 
+    def _liveness_loop(self) -> None:
+        """Mantiene el failure detector independiente de la difusión Gossip.
+
+        Si una ronda Gossip o el plano de datos se retrasa, este ciclo sigue
+        renovando liveness mediante probes concurrentes y evaluando timeouts.
+        """
+        while self.running:
+            time.sleep(self.liveness_interval)
+            if not self.running:
+                break
+
+            probed = self._probe_membership_liveness()
+            changes = self.membership.run_failure_check()
+
+            if self.metrics:
+                for node_id, status in changes.items():
+                    self.metrics.record_membership_change(
+                        peer_id=node_id,
+                        status=status,
+                    )
+
+            if changes:
+                print(
+                    f"[liveness] probed={probed} changes={changes} "
+                    f"view={list(self.membership.peers)}",
+                    flush=True,
+                )
+
     def _gossip_loop(self) -> None:
         while self.running:
             time.sleep(self.gossip.interval)
-            if self.running:
-                sent = self.gossip.round()
-                changes = self.membership.run_failure_check()
-                if self.metrics:
-                    active = [p.node_id for p in self.membership.peers.values() if p.status == "alive"]
-                    suspect = [p.node_id for p in self.membership.peers.values() if p.status == "suspect"]
-                    failed = [p.node_id for p in self.membership.peers.values() if p.status == "failed"]
-                    self.metrics.record_gossip(active, suspect, failed, sent)
-                if sent or changes:
-                    print(
-                        f"[gossip] sent={sent} changes={changes} "
-                        f"view={list(self.membership.peers)}",
-                        flush=True,
-                    )
+            if not self.running:
+                break
+
+            sent = self.gossip.round()
+
+            if self.metrics:
+                liveness = self.membership.failure_detector.snapshot()
+                active = [
+                    node_id
+                    for node_id, state in liveness.items()
+                    if state.get("status") == "alive"
+                ]
+                suspect = [
+                    node_id
+                    for node_id, state in liveness.items()
+                    if state.get("status") == "suspect"
+                ]
+                failed = [
+                    node_id
+                    for node_id, state in liveness.items()
+                    if state.get("status") == "failed"
+                ]
+
+                self.metrics.record_gossip(
+                    active,
+                    suspect,
+                    failed,
+                    sent,
+                    changes={},
+                )
+
+            if sent:
+                print(
+                    f"[gossip] sent={sent} changes={{}} "
+                    f"view={list(self.membership.peers)}",
+                    flush=True,
+                )
 
 
 def load_peers(path: str) -> list[PeerInfo]:
@@ -461,6 +649,8 @@ def main() -> int:
     parser.add_argument("--priority-subjective", type=int, default=50)
     parser.add_argument("--failure-timeout", type=float, default=5.0)
     parser.add_argument("--suspect-timeout", type=float, default=5.0)
+    parser.add_argument("--control-timeout", type=float, default=0.75, help="Timeout corto para PING/Gossip")
+    parser.add_argument("--listen-backlog", type=int, default=512, help="Backlog TCP del peer")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--topics", default="", help="Comma separated list of initial topics/communes")
     parser.add_argument("--runs-dir", default=None, help="Base directory for runs")
@@ -485,6 +675,8 @@ def main() -> int:
         seed=args.seed,
         runs_dir=args.runs_dir,
         run_id=args.run_id,
+        control_timeout=args.control_timeout,
+        listen_backlog=args.listen_backlog,
     )
 
     if args.topics:

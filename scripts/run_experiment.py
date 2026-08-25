@@ -101,6 +101,8 @@ def main() -> int:
         help="Cantidad de nodos Peer en la malla",
     )
     parser.add_argument("--fanout", type=int, default=2, help="Gossip fanout")
+    parser.add_argument("--control-timeout", type=float, default=0.75, help="Timeout del plano de control PING/Gossip")
+    parser.add_argument("--listen-backlog", type=int, default=512, help="Backlog TCP de cada Peer")
     parser.add_argument(
         "--pubsub-fanout",
         type=int,
@@ -277,6 +279,10 @@ def main() -> int:
                 str(hostfile_path),
                 "--fanout",
                 str(args.fanout),
+                "--control-timeout",
+                str(args.control_timeout),
+                "--listen-backlog",
+                str(args.listen_backlog),
                 "--pubsub-fanout-objective",
                 str(pubsub_fanout_objective),
                 "--pubsub-fanout-subjective",
@@ -348,6 +354,10 @@ def main() -> int:
                 str(hostfile_path),
                 "--fanout",
                 str(args.fanout),
+                "--control-timeout",
+                str(args.control_timeout),
+                "--listen-backlog",
+                str(args.listen_backlog),
                 "--runs-dir",
                 str(runs_dir),
                 "--run-id",
@@ -405,6 +415,10 @@ def main() -> int:
                     str(hostfile_path),
                     "--fanout",
                     str(args.fanout),
+                    "--control-timeout",
+                    str(args.control_timeout),
+                    "--listen-backlog",
+                    str(args.listen_backlog),
                     "--runs-dir",
                     str(runs_dir),
                     "--run-id",

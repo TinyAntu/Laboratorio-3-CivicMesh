@@ -11,9 +11,15 @@ ALLOCATION_FILE="${RUN_DIR}/allocation.txt"
 EXPERIMENT_LOG="${RUN_DIR}/logs/experiment.log"
 CONTROL_METRICS="${RUN_DIR}/metrics/control_events.jsonl"
 OBSERVE_SECONDS="${CIVICMESH_FAILURE_OBSERVE_SECONDS:-12}"
+PYTHON_BIN="python3"
 
 if [[ -z "${RUN_ID}" ]]; then
     echo "Uso: $0 <RUN_ID|SLURM_JOB_ID> [PEER_ID]" >&2
+    exit 1
+fi
+
+if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+    echo "[ERROR] No se encontró python3 en el entorno del clúster." >&2
     exit 1
 fi
 
@@ -45,7 +51,7 @@ log() {
 record_control_event() {
     local phase="$1"
     local method="$2"
-    python - "${CONTROL_METRICS}" "${RUN_ID}" "${TARGET_PEER}" "${TARGET_HOST}" "${phase}" "${method}" <<'PY'
+    "${PYTHON_BIN}" - "${CONTROL_METRICS}" "${RUN_ID}" "${TARGET_PEER}" "${TARGET_HOST}" "${phase}" "${method}" <<'PY'
 import json
 import sys
 import time

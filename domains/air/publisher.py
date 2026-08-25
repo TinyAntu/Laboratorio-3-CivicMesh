@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import threading
 import time
 from pathlib import Path
 
@@ -40,9 +41,10 @@ class AirQualityPublisher:
         self.subjective_only = bool(subjective_only)
         self.step = 0
 
-        # Rumores subjetivos recibidos desde otros peers/publicadores
-        # durante el paso anterior.
-        self.received_rumors: list[float] = []
+        # Rumores subjetivos agrupados por paso lógico. El paso t consume
+        # exclusivamente los rumores publicados en t-1.
+        self.received_rumors: dict[int, list[float]] = {}
+        self._rumor_lock = threading.Lock()
 
         self.peer.on_message(self._handle_message)
 
@@ -75,19 +77,37 @@ class AirQualityPublisher:
 
         try:
             value = float(payload["value"])
-            self.received_rumors.append(value)
+            rumor_step = int(metadata["step"])
         except (KeyError, TypeError, ValueError):
             return
 
+        if rumor_step < self.step - 1:
+            return
+
+        with self._rumor_lock:
+            self.received_rumors.setdefault(rumor_step, []).append(value)
+
     def _consume_gossip_value(self) -> float:
-        """Promedia los rumores recibidos y limpia el buffer."""
-        if not self.received_rumors:
+        """Consume únicamente rumores del paso lógico anterior."""
+        target_step = self.step - 1
+
+        if target_step < 0:
             return 0.0
 
-        gossip_value = sum(self.received_rumors) / len(self.received_rumors)
-        self.received_rumors.clear()
+        with self._rumor_lock:
+            values = self.received_rumors.pop(target_step, [])
+            stale_steps = [
+                step
+                for step in self.received_rumors
+                if step < target_step
+            ]
+            for step in stale_steps:
+                self.received_rumors.pop(step, None)
 
-        return gossip_value
+        if not values:
+            return 0.0
+
+        return sum(values) / len(values)
 
     def run_step(self) -> tuple[float, float]:
         sample = self.replay.next_sample()
@@ -190,6 +210,8 @@ def main() -> int:
     parser.add_argument("--seeds-file")
     parser.add_argument("--fanout", type=int, default=2)
     parser.add_argument("--pubsub-fanout", type=int, default=3)
+    parser.add_argument("--control-timeout", type=float, default=0.75)
+    parser.add_argument("--listen-backlog", type=int, default=512)
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--runs-dir", default=None, help="Base directory for runs")
     parser.add_argument("--run-id", default=None, help="Identifier for current run")
@@ -232,6 +254,8 @@ def main() -> int:
         seed=config.seed,
         runs_dir=args.runs_dir,
         run_id=args.run_id,
+        control_timeout=args.control_timeout,
+        listen_backlog=args.listen_backlog,
     )
 
     if args.topics:

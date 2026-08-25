@@ -154,3 +154,31 @@ def test_collectors_do_not_contend_on_shared_events_file():
         records = load_metrics_from_run(Path(tmpdir) / run_id)
         assert len(records) == 200
         assert all(record["event"] == "drop" for record in records)
+
+
+def test_membership_transitions_are_recorded_explicitly(tmp_path):
+    collector = MetricsCollector(
+        node_id="peer0",
+        run_id="membership-run",
+        runs_dir=tmp_path,
+    )
+
+    collector.record_membership_change("peer1", "suspect")
+    collector.record_membership_change("peer1", "failed")
+    collector.record_gossip(
+        active_peers=["peer2"],
+        suspect_peers=[],
+        failed_peers=["peer1"],
+        sent_count=1,
+        changes={"peer1": "failed"},
+    )
+
+    records = load_metrics_from_run(tmp_path / "membership-run")
+    transitions = [r for r in records if r.get("event") == "membership_change"]
+    gossip = [r for r in records if r.get("event") == "gossip"][-1]
+
+    assert [r["status"] for r in transitions] == ["suspect", "failed"]
+    assert all(r["peer_id"] == "peer1" for r in transitions)
+    assert gossip["failed_count"] == 1
+    assert gossip["failed_peers"] == ["peer1"]
+    assert gossip["changes"] == {"peer1": "failed"}

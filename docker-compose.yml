@@ -12,7 +12,23 @@ services:
     build: .
     container_name: civicmesh_peer0
     hostname: peer0
-    command: python -m network.peer --node-id p0 --host 0.0.0.0 --port 9000 --fanout 2 --seed 42
+    command: >-
+      python -m network.peer
+      --node-id p0
+      --host peer0
+      --port 9000
+      --fanout 2
+      --max-view-size 8
+      --pubsub-fanout-objective 3
+      --pubsub-fanout-subjective 2
+      --ttl-objective 3
+      --ttl-subjective 5
+      --priority-objective 80
+      --priority-subjective 50
+      --topics Santiago
+      --seed 42
+      --runs-dir /app/runs
+      --run-id compose-run
     ports:
       - "9000:9000"
     volumes:
@@ -25,7 +41,24 @@ services:
     build: .
     container_name: civicmesh_peer1
     hostname: peer1
-    command: python -m network.peer --node-id p1 --host 0.0.0.0 --port 9001 --seeds-file seeds_compose.txt --fanout 2 --seed 43
+    command: >-
+      python -m network.peer
+      --node-id p1
+      --host peer1
+      --port 9001
+      --seeds-file seeds_compose.txt
+      --fanout 2
+      --max-view-size 8
+      --pubsub-fanout-objective 3
+      --pubsub-fanout-subjective 2
+      --ttl-objective 3
+      --ttl-subjective 5
+      --priority-objective 80
+      --priority-subjective 50
+      --topics Santiago
+      --seed 43
+      --runs-dir /app/runs
+      --run-id compose-run
     ports:
       - "9001:9001"
     depends_on:
@@ -40,7 +73,24 @@ services:
     build: .
     container_name: civicmesh_peer2
     hostname: peer2
-    command: python -m network.peer --node-id p2 --host 0.0.0.0 --port 9002 --seeds-file seeds_compose.txt --fanout 2 --seed 44
+    command: >-
+      python -m network.peer
+      --node-id p2
+      --host peer2
+      --port 9002
+      --seeds-file seeds_compose.txt
+      --fanout 2
+      --max-view-size 8
+      --pubsub-fanout-objective 3
+      --pubsub-fanout-subjective 2
+      --ttl-objective 3
+      --ttl-subjective 5
+      --priority-objective 80
+      --priority-subjective 50
+      --topics Santiago
+      --seed 44
+      --runs-dir /app/runs
+      --run-id compose-run
     ports:
       - "9002:9002"
     depends_on:
@@ -55,7 +105,16 @@ services:
     build: .
     container_name: civicmesh_publisher0
     hostname: publisher0
-    command: python -m domains.crime.publisher --node-id pub0 --host 0.0.0.0 --port 9500 --commune Santiago --seeds-file seeds_compose.txt --fanout 2 --pubsub-fanout 2 --runs-dir /app/runs --run-id compose-run
+    command: >-
+      python -m domains.crime.publisher
+      --node-id pub0
+      --host publisher0
+      --port 9500
+      --commune Santiago
+      --seeds-file seeds_compose.txt
+      --fanout 2
+      --runs-dir /app/runs
+      --run-id compose-run
     depends_on:
       - peer0
       - peer1
@@ -69,14 +128,27 @@ services:
   frontend:
     build: .
     container_name: civicmesh_frontend
-    hostname: frontend
-    command: streamlit run frontend/app.py --server.port 8501 --server.address 0.0.0.0
-    ports:
-      - "8501:8501"
+
+    command: >-
+      streamlit run frontend/app.py
+      --server.address 0.0.0.0
+      --server.port 8501
+
     environment:
-      - CIVICMESH_RUNS=/app/runs
+      CIVICMESH_RUNS: /app/runs
+      PYTHONPATH: /app
+
     volumes:
       - civicmesh_runs:/app/runs
+
+    ports:
+      - "8501:8501"
+
     networks:
       - civicmesh_net
-    restart: unless-stopped
+
+    depends_on:
+      - peer0
+      - peer1
+      - peer2
+      - publisher0

@@ -170,7 +170,14 @@ class MetricsCollector:
         suspect_peers: list[str],
         failed_peers: list[str],
         sent_count: int,
+        changes: dict[str, str] | None = None,
     ) -> None:
+        """Registra el estado de liveness conocido en una ronda Gossip.
+
+        Las listas se construyen desde el FailureDetector para mantener una
+        única fuente de verdad de los miembros actualmente monitorizados y sus
+        estados ``alive``/``suspect``/``failed``.
+        """
         record = {
             "timestamp": time.time(),
             "event": "gossip",
@@ -180,9 +187,33 @@ class MetricsCollector:
             "failed_count": len(failed_peers),
             "sent_count": sent_count,
             "active_peers": active_peers,
+            "suspect_peers": suspect_peers,
             "failed_peers": failed_peers,
+            "changes": dict(changes or {}),
         }
         self._write_record(record)
+
+    def record_membership_change(
+        self,
+        peer_id: str,
+        status: str,
+    ) -> None:
+        """Registra explícitamente una transición de membresía.
+
+        Este evento permite reconstruir con precisión cuándo un nodo pasó a
+        ``suspect`` o ``failed`` sin depender de que siga presente en la vista
+        parcial del peer observador.
+        """
+        if status not in {"alive", "suspect", "failed"}:
+            raise ValueError(f"Estado de membresía inválido: {status}")
+
+        self._write_record({
+            "timestamp": time.time(),
+            "event": "membership_change",
+            "node_id": self.node_id,
+            "peer_id": peer_id,
+            "status": status,
+        })
 
     def record_step(
         self,
