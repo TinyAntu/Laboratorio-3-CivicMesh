@@ -1,8 +1,9 @@
-import json
 import os
 from pathlib import Path
 import time
 import streamlit as st
+
+from network.metrics import load_metrics_from_run
 
 # Configuración inicial de la página
 st.set_page_config(
@@ -48,29 +49,9 @@ metrics_path = runs_dir / selected_run / "metrics"
 
 @st.cache_data(ttl=1.0 if auto_refresh else 60.0)
 def load_data(run_metrics_dir: str):
-    p = Path(run_metrics_dir)
-    records = []
-    events_file = p / "events.jsonl"
-    if events_file.exists():
-        with open(events_file, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if line:
-                    try:
-                        records.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        pass
-    else:
-        for f in p.glob("*.jsonl"):
-            with open(f, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if line:
-                        try:
-                            records.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            pass
-    return sorted(records, key=lambda x: float(x.get("timestamp", 0)))
+    # Usar el mismo loader que análisis/experimentos para mantener un único
+    # contrato de lectura y no perder forward/drop/gossip.
+    return load_metrics_from_run(run_metrics_dir)
 
 
 records = load_data(str(metrics_path))
