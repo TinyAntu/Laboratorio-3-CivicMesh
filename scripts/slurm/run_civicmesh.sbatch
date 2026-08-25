@@ -28,6 +28,33 @@ PROJECT_ROOT="${CIVICMESH_PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
 cd "${PROJECT_ROOT}"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
+# ------------------------------------------------------------------------------
+# Python del clúster
+# ------------------------------------------------------------------------------
+PYTHON_BIN="python3"
+
+if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+    echo "[ERROR] No se encontró python3 en el entorno del clúster." >&2
+    exit 1
+fi
+
+echo "[SLURM] Python=$("${PYTHON_BIN}" --version 2>&1)"
+
+if ! "${PYTHON_BIN}" -c "import yaml" >/dev/null 2>&1; then
+    echo "[ERROR] PyYAML no está disponible para python3." >&2
+    echo "        Instálalo con: python3 -m pip install --user -r requirements.txt" >&2
+    exit 1
+fi
+
+if ! "${PYTHON_BIN}" -c "import streamlit" >/dev/null 2>&1; then
+    echo "[ERROR] Streamlit no está disponible para python3." >&2
+    echo "        Instálalo con: python3 -m pip install --user -r requirements.txt" >&2
+    exit 1
+fi
+
+echo "[SLURM] Dependencias Python básicas OK"
+
+
 RUN_ID="${SLURM_JOB_ID}"
 CPU_JOB_ID="${SLURM_JOB_ID_HET_GROUP_0:-${SLURM_JOB_ID}}"
 GPU_JOB_ID="${SLURM_JOB_ID_HET_GROUP_1:-}"
@@ -100,7 +127,7 @@ printf '[SLURM] GPU hosts (CPU only): %s %s (component job %s)\n' "${GPU_NODE_1}
 # ------------------------------------------------------------------------------
 # Leer parámetros efectivos desde config.yaml
 # ------------------------------------------------------------------------------
-mapfile -t CFG_VALUES < <(python - "${RUN_CONFIG}" <<'PY'
+mapfile -t CFG_VALUES < <("${PYTHON_BIN}" - "${RUN_CONFIG}" <<'PY'
 import sys
 import yaml
 
@@ -117,6 +144,12 @@ print(cfg["pubsub"]["subjective"].get("priority", 50))
 PY
 )
 
+if [[ ${#CFG_VALUES[@]} -ne 7 ]]; then
+    echo "[ERROR] No se pudo leer correctamente config.yaml." >&2
+    echo "        Se esperaban 7 valores y se obtuvieron ${#CFG_VALUES[@]}." >&2
+    exit 1
+fi
+
 SEED="${CFG_VALUES[0]}"
 FANOUT_OBJECTIVE="${CFG_VALUES[1]}"
 FANOUT_SUBJECTIVE="${CFG_VALUES[2]}"
@@ -126,8 +159,10 @@ PRIORITY_OBJECTIVE="${CFG_VALUES[5]}"
 PRIORITY_SUBJECTIVE="${CFG_VALUES[6]}"
 GOSSIP_FANOUT="${CIVICMESH_GOSSIP_FANOUT:-2}"
 MAX_VIEW_SIZE="${CIVICMESH_MAX_VIEW_SIZE:-8}"
+CONTROL_TIMEOUT="${CIVICMESH_CONTROL_TIMEOUT:-0.75}"
+LISTEN_BACKLOG="${CIVICMESH_LISTEN_BACKLOG:-512}"
 # Comunas disponibles en ambos dominios según config.
-mapfile -t COMMUNES < <(python - "${RUN_CONFIG}" <<'PY'
+mapfile -t COMMUNES < <("${PYTHON_BIN}" - "${RUN_CONFIG}" <<'PY'
 import sys
 import yaml
 
@@ -197,6 +232,7 @@ launch_step() {
         --ntasks=1 \
         --cpus-per-task=1 \
         --exact \
+        --overlap \
         --job-name="${name}" \
         "$@" \
         > "${logfile}" 2>&1 &
@@ -210,6 +246,8 @@ launch_step() {
 PEER_COMMON=(
     --fanout "${GOSSIP_FANOUT}"
     --max-view-size "${MAX_VIEW_SIZE}"
+    --control-timeout "${CONTROL_TIMEOUT}"
+    --listen-backlog "${LISTEN_BACKLOG}"
     --pubsub-fanout-objective "${FANOUT_OBJECTIVE}"
     --pubsub-fanout-subjective "${FANOUT_SUBJECTIVE}"
     --ttl-objective "${TTL_OBJECTIVE}"
@@ -222,19 +260,19 @@ PEER_COMMON=(
 )
 
 launch_step "peer-p0" 0 "${CPU_NODE_1}" 9000 "${RUN_DIR}/logs/peer_p0.log" \
-    python -m network.peer --node-id p0 --host "${CPU_NODE_1}" --port 9000 \
+    "${PYTHON_BIN}" -m network.peer --node-id p0 --host "${CPU_NODE_1}" --port 9000 \
     --seed "$((SEED + 0))" "${PEER_COMMON[@]}"
 
 launch_step "peer-p1" 0 "${CPU_NODE_1}" 9001 "${RUN_DIR}/logs/peer_p1.log" \
-    python -m network.peer --node-id p1 --host "${CPU_NODE_1}" --port 9001 \
+    "${PYTHON_BIN}" -m network.peer --node-id p1 --host "${CPU_NODE_1}" --port 9001 \
     --seeds-file "${HOSTFILE}" --seed "$((SEED + 1))" "${PEER_COMMON[@]}"
 
 launch_step "peer-p2" 0 "${CPU_NODE_2}" 9002 "${RUN_DIR}/logs/peer_p2.log" \
-    python -m network.peer --node-id p2 --host "${CPU_NODE_2}" --port 9002 \
+    "${PYTHON_BIN}" -m network.peer --node-id p2 --host "${CPU_NODE_2}" --port 9002 \
     --seeds-file "${HOSTFILE}" --seed "$((SEED + 2))" "${PEER_COMMON[@]}"
 
 launch_step "peer-p3" 0 "${CPU_NODE_2}" 9003 "${RUN_DIR}/logs/peer_p3.log" \
-    python -m network.peer --node-id p3 --host "${CPU_NODE_2}" --port 9003 \
+    "${PYTHON_BIN}" -m network.peer --node-id p3 --host "${CPU_NODE_2}" --port 9003 \
     --seeds-file "${HOSTFILE}" --seed "$((SEED + 3))" "${PEER_COMMON[@]}"
 
 # Dar tiempo a que los sockets estén escuchando y se estabilice JOIN/Gossip.
@@ -253,18 +291,20 @@ if [[ "${DOMAIN}" == "crime" || "${DOMAIN}" == "both" ]]; then
 
         launch_step "crime-${slug}" 1 "${GPU_NODE_1}" "${main_port}" \
             "${RUN_DIR}/logs/crime_${slug}.log" \
-            env CUDA_VISIBLE_DEVICES="" python -m domains.crime.publisher \
+            env CUDA_VISIBLE_DEVICES="" "${PYTHON_BIN}" -m domains.crime.publisher \
             --node-id "pub_crime_${slug}" --host "${GPU_NODE_1}" --port "${main_port}" \
             --commune "${commune}" --config "${RUN_CONFIG}" \
             --seeds-file "${HOSTFILE}" --topics "${commune}" \
+            --control-timeout "${CONTROL_TIMEOUT}" --listen-backlog "${LISTEN_BACKLOG}" \
             --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}"
 
         launch_step "crime-rumor-${slug}" 1 "${GPU_NODE_1}" "${rumor_port}" \
             "${RUN_DIR}/logs/crime_rumor_${slug}.log" \
-            env CUDA_VISIBLE_DEVICES="" python -m domains.crime.publisher \
+            env CUDA_VISIBLE_DEVICES="" "${PYTHON_BIN}" -m domains.crime.publisher \
             --node-id "rumor_crime_${slug}" --host "${GPU_NODE_1}" --port "${rumor_port}" \
             --commune "${commune}" --config "${RUN_CONFIG}" \
             --seeds-file "${HOSTFILE}" --topics "${commune}" --subjective-only \
+            --control-timeout "${CONTROL_TIMEOUT}" --listen-backlog "${LISTEN_BACKLOG}" \
             --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}"
 
         idx=$((idx + 1))
@@ -280,18 +320,20 @@ if [[ "${DOMAIN}" == "air" || "${DOMAIN}" == "both" ]]; then
 
         launch_step "air-${slug}" 1 "${GPU_NODE_2}" "${main_port}" \
             "${RUN_DIR}/logs/air_${slug}.log" \
-            env CUDA_VISIBLE_DEVICES="" python -m domains.air.publisher \
+            env CUDA_VISIBLE_DEVICES="" "${PYTHON_BIN}" -m domains.air.publisher \
             --node-id "pub_air_${slug}" --host "${GPU_NODE_2}" --port "${main_port}" \
             --commune "${commune}" --config "${RUN_CONFIG}" \
             --seeds-file "${HOSTFILE}" --topics "${commune}" --loop \
+            --control-timeout "${CONTROL_TIMEOUT}" --listen-backlog "${LISTEN_BACKLOG}" \
             --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}"
 
         launch_step "air-rumor-${slug}" 1 "${GPU_NODE_2}" "${rumor_port}" \
             "${RUN_DIR}/logs/air_rumor_${slug}.log" \
-            env CUDA_VISIBLE_DEVICES="" python -m domains.air.publisher \
+            env CUDA_VISIBLE_DEVICES="" "${PYTHON_BIN}" -m domains.air.publisher \
             --node-id "rumor_air_${slug}" --host "${GPU_NODE_2}" --port "${rumor_port}" \
             --commune "${commune}" --config "${RUN_CONFIG}" \
             --seeds-file "${HOSTFILE}" --topics "${commune}" --subjective-only --loop \
+            --control-timeout "${CONTROL_TIMEOUT}" --listen-backlog "${LISTEN_BACKLOG}" \
             --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}"
 
         idx=$((idx + 1))
@@ -303,7 +345,7 @@ fi
 # ------------------------------------------------------------------------------
 launch_step "frontend" 1 "${GPU_NODE_2}" 8501 "${RUN_DIR}/logs/frontend.log" \
     env CUDA_VISIBLE_DEVICES="" CIVICMESH_RUNS="${BASE_RUNS_DIR}" \
-    streamlit run frontend/app.py \
+    "${PYTHON_BIN}" -m streamlit run frontend/app.py \
     --server.port 8501 \
     --server.address 0.0.0.0 \
     --server.headless true

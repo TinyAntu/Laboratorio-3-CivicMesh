@@ -174,10 +174,9 @@ class MetricsCollector:
     ) -> None:
         """Registra el estado de liveness conocido en una ronda Gossip.
 
-        Las listas deben construirse desde el FailureDetector, no solo desde
-        la vista parcial de Membership. Un peer puede haber salido de la vista
-        y aun así conservar un estado ``suspect``/``failed`` relevante para
-        medir tiempo de detección.
+        Las listas se construyen desde el FailureDetector para mantener una
+        única fuente de verdad de los miembros actualmente monitorizados y sus
+        estados ``alive``/``suspect``/``failed``.
         """
         record = {
             "timestamp": time.time(),

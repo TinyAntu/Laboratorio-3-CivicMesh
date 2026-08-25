@@ -57,6 +57,12 @@ class Membership:
         # vista por max_view_size.
         self._known_peers: dict[str, PeerInfo] = {}
 
+        # Peers de bootstrap configurados explícitamente (seeds). Se mantienen
+        # preferentemente en la vista para que la detección de fallos de los
+        # peers estructurales no dependa de la rotación aleatoria causada por
+        # publishers u otros participantes Gossip.
+        self._persistent_peers: set[str] = set()
+
         self.failure_detector = FailureDetector(
             timeout=self.config.failure_timeout,
             suspect_timeout=self.config.suspect_timeout,
@@ -82,21 +88,39 @@ class Membership:
         if peer is not None:
             self._remember_peer(peer)
 
+            # Un peer fuera de la vista parcial deja de estar bajo
+            # monitorización activa. Mantener su reloj corriendo mientras no
+            # puede ser elegido/probado produciría falsos positivos. El
+            # historial de incarnation/status se conserva en _known_peers.
+            self.failure_detector.remove(node_id)
+
     def _select_eviction_candidate(self) -> str | None:
-        """Selecciona qué peer expulsar cuando la vista está llena."""
+        """Selecciona qué peer expulsar cuando la vista está llena.
+
+        Los seeds persistentes se conservan siempre que exista algún miembro
+        no persistente que pueda rotar. Así la vista sigue siendo acotada y
+        parcial, pero los peers estructurales permanecen monitorizables.
+        """
         if not self.peers:
             return None
 
+        rotatable = [
+            peer
+            for peer in self.peers.values()
+            if peer.node_id not in self._persistent_peers
+        ]
+        pool = rotatable if rotatable else list(self.peers.values())
+
         non_alive = [
             peer.node_id
-            for peer in self.peers.values()
+            for peer in pool
             if peer.status != "alive"
         ]
 
         if non_alive:
             return self.rng.choice(non_alive)
 
-        return self.rng.choice(list(self.peers.keys()))
+        return self.rng.choice([peer.node_id for peer in pool])
 
     def _make_room_for_new_peer(self) -> None:
         if len(self.peers) < self.config.max_view_size:
@@ -110,6 +134,7 @@ class Membership:
         self,
         peer: PeerInfo,
         now: float | None = None,
+        persistent: bool = False,
     ) -> bool:
         """
         Agrega o actualiza un peer usando evidencia DIRECTA.
@@ -120,6 +145,9 @@ class Membership:
         """
         if peer.node_id == self.self_peer.node_id:
             return False
+
+        if persistent:
+            self._persistent_peers.add(peer.node_id)
 
         now = time.monotonic() if now is None else now
         current = self.peers.get(peer.node_id)
@@ -262,21 +290,26 @@ class Membership:
 
         self._remember_peer(updated)
 
-        # Si había salido de la vista, puede reingresar conservando el reloj
-        # previo. Un failed no puede volver por información stale.
+        # Si había salido de la vista, puede reingresar como miembro activo.
+        # El tiempo pasado fuera de la vista NO cuenta para failure_timeout,
+        # porque durante ese período este nodo no estaba siendo monitorizado.
+        # La misma incarnation marcada previamente como failed permanece como
+        # tombstone y no puede revivir por una mención indirecta.
         if current is None:
-            failure_state = self.failure_detector.get_state(peer.node_id)
-
-            if failure_state is not None and failure_state.status == "failed":
+            if reference.status == "failed":
                 return False
 
             self._make_room_for_new_peer()
-
-            if failure_state is not None:
-                updated.last_seen = failure_state.last_seen
-                updated.status = failure_state.status
-
+            updated.last_seen = now
+            updated.status = "alive"
             self.peers[peer.node_id] = updated
+
+            # Comienza una nueva ventana de monitorización. Esto no convierte
+            # Gossip en heartbeat: mientras permanezca en la vista, nuevas
+            # menciones indirectas no refrescarán este reloj. Peer realizará
+            # PING directo periódico para aportar evidencia real de liveness.
+            self.failure_detector.observe(peer.node_id, now)
+            self._remember_peer(updated)
             return True
 
         # Si sigue en la vista, conservar status/last_seen locales.
@@ -330,6 +363,7 @@ class Membership:
         return {
             "self": self.self_peer.to_dict(),
             "max_view_size": self.config.max_view_size,
+            "persistent_peers": sorted(self._persistent_peers),
             "peers": {
                 node_id: peer.to_dict()
                 for node_id, peer in self.peers.items()

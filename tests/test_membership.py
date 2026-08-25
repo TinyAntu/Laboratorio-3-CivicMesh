@@ -182,7 +182,7 @@ def test_higher_incarnation_can_recover_peer_learned_by_gossip():
     assert membership.failure_detector.status("p1") == "alive"
 
 
-def test_eviction_and_indirect_relearning_do_not_reset_failure_clock():
+def test_eviction_pauses_monitoring_and_reentry_starts_new_window():
     membership = Membership(
         peer("p0", 9000),
         MembershipConfig(
@@ -195,22 +195,79 @@ def test_eviction_and_indirect_relearning_do_not_reset_failure_clock():
 
     membership.add_peer(peer("p1", 9001), now=0)
 
-    # Forzamos la expulsión de p1 de la vista parcial agregando otro peer.
+    # Al salir de la vista parcial, p1 deja de estar bajo monitorización
+    # activa. El tiempo fuera de la vista no debe convertirlo en failed.
     membership.add_peer(peer("p2", 9002), now=1)
     assert "p1" not in membership.peers
+    assert membership.failure_detector.get_state("p1") is None
 
-    # p1 reaparece solo porque otro nodo lo menciona en Gossip. Debe conservar
-    # el reloj original, no recibir last_seen=4.
+    # Si p1 reaparece indirectamente, comienza una nueva ventana de
+    # monitorización. La mención inicial permite volver a probarlo, pero no
+    # actúa como heartbeat continuo.
     membership.merge([peer("p1", 9001).to_dict()], now=4)
 
     state = membership.failure_detector.get_state("p1")
     assert state is not None
-    assert state.last_seen == 0
+    assert state.last_seen == 4
+    assert state.status == "alive"
 
-    assert membership.run_failure_check(now=6).get("p1") == "suspect"
-
-    # Otra repetición indirecta tampoco lo revive.
+    # Una nueva mención indirecta mientras sigue en la vista NO refresca el
+    # reloj. Si no existe evidencia directa, el timeout sigue avanzando.
     membership.merge([peer("p1", 9001).to_dict()], now=7)
-    assert membership.failure_detector.status("p1") == "suspect"
+    state = membership.failure_detector.get_state("p1")
+    assert state is not None
+    assert state.last_seen == 4
 
-    assert membership.run_failure_check(now=11).get("p1") == "failed"
+    assert membership.run_failure_check(now=10).get("p1") == "suspect"
+    assert membership.run_failure_check(now=15).get("p1") == "failed"
+
+
+def test_failed_tombstone_is_not_resurrected_after_leaving_partial_view():
+    membership = Membership(
+        peer("p0", 9000),
+        MembershipConfig(
+            max_view_size=2,
+            failure_timeout=5,
+            suspect_timeout=5,
+        ),
+        seed=3,
+    )
+
+    membership.add_peer(peer("p1", 9001), now=0)
+    membership.run_failure_check(now=11)
+    assert membership.peers["p1"].status == "failed"
+
+    membership.remove_failed()
+    assert "p1" not in membership.peers
+    assert membership._known_peers["p1"].status == "failed"
+
+    # Gossip stale con la misma incarnation no puede revivir el tombstone.
+    assert membership.merge([peer("p1", 9001).to_dict()], now=20) == 0
+    assert "p1" not in membership.peers
+
+    # Una incarnation mayor sí representa un reinicio válido.
+    restarted = peer("p1", 9001)
+    restarted.incarnation = 1
+    assert membership.merge([restarted.to_dict()], now=21) == 1
+    assert membership.peers["p1"].status == "alive"
+
+
+def test_persistent_seed_is_not_evicted_by_rotating_members():
+    membership = Membership(
+        peer("p0", 9000),
+        MembershipConfig(max_view_size=3),
+        seed=7,
+    )
+
+    membership.add_peer(peer("p1", 9001), now=0, persistent=True)
+    membership.add_peer(peer("pub1", 9101), now=0)
+    membership.add_peer(peer("pub2", 9102), now=0)
+
+    # La vista está llena. Al aprender nuevos participantes deben rotar los
+    # miembros no persistentes, nunca el seed p1.
+    for i in range(3, 8):
+        membership.add_peer(peer(f"pub{i}", 9100 + i), now=i)
+        assert "p1" in membership.peers
+
+    assert len(membership.peers) == 3
+    assert "p1" in membership._persistent_peers

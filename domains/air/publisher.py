@@ -210,6 +210,8 @@ def main() -> int:
     parser.add_argument("--seeds-file")
     parser.add_argument("--fanout", type=int, default=2)
     parser.add_argument("--pubsub-fanout", type=int, default=3)
+    parser.add_argument("--control-timeout", type=float, default=0.75)
+    parser.add_argument("--listen-backlog", type=int, default=512)
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--runs-dir", default=None, help="Base directory for runs")
     parser.add_argument("--run-id", default=None, help="Identifier for current run")
@@ -252,6 +254,8 @@ def main() -> int:
         seed=config.seed,
         runs_dir=args.runs_dir,
         run_id=args.run_id,
+        control_timeout=args.control_timeout,
+        listen_backlog=args.listen_backlog,
     )
 
     if args.topics:
