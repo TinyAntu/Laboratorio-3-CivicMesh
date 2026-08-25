@@ -51,6 +51,7 @@ def create_experiment_run(
     with open(config_source, "r", encoding="utf-8") as src:
         runtime_config = yaml.safe_load(src)
 
+    runtime_config["seed"] = seed
     runtime_config["pubsub"]["objective"]["fanout"] = pubsub_fanout_objective
     runtime_config["pubsub"]["subjective"]["fanout"] = pubsub_fanout_subjective
     runtime_config["pubsub"]["objective"]["ttl"] = ttl_objective
