@@ -70,19 +70,19 @@ cat "${RUN_DIR}/hostfile.txt"
 echo "[SLURM] Arrancando Peers en Nodos CPU (${CPU_NODE_1}, ${CPU_NODE_2})..."
 
 srun --nodelist=${CPU_NODE_1} --nodes=1 --ntasks=1 \
-    python -m network.peer --node-id p0 --host ${CPU_NODE_1} --port 9000 --fanout 2 --seed 42 \
+    python -m network.peer --node-id p0 --host ${CPU_NODE_1} --port 9000 --fanout 2 --seed 42 --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}" \
     > "${RUN_DIR}/logs/peer_p0.log" 2>&1 &
 
 srun --nodelist=${CPU_NODE_1} --nodes=1 --ntasks=1 \
-    python -m network.peer --node-id p1 --host ${CPU_NODE_1} --port 9001 --seeds-file "${RUN_DIR}/hostfile.txt" --fanout 2 --seed 43 \
+    python -m network.peer --node-id p1 --host ${CPU_NODE_1} --port 9001 --seeds-file "${RUN_DIR}/hostfile.txt" --fanout 2 --seed 43 --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}" \
     > "${RUN_DIR}/logs/peer_p1.log" 2>&1 &
 
 srun --nodelist=${CPU_NODE_2} --nodes=1 --ntasks=1 \
-    python -m network.peer --node-id p2 --host ${CPU_NODE_2} --port 9002 --seeds-file "${RUN_DIR}/hostfile.txt" --fanout 2 --seed 44 \
+    python -m network.peer --node-id p2 --host ${CPU_NODE_2} --port 9002 --seeds-file "${RUN_DIR}/hostfile.txt" --fanout 2 --seed 44 --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}" \
     > "${RUN_DIR}/logs/peer_p2.log" 2>&1 &
 
 srun --nodelist=${CPU_NODE_2} --nodes=1 --ntasks=1 \
-    python -m network.peer --node-id p3 --host ${CPU_NODE_3:-${CPU_NODE_2}} --port 9003 --seeds-file "${RUN_DIR}/hostfile.txt" --fanout 2 --seed 45 \
+    python -m network.peer --node-id p3 --host ${CPU_NODE_3:-${CPU_NODE_2}} --port 9003 --seeds-file "${RUN_DIR}/hostfile.txt" --fanout 2 --seed 45 --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}" \
     > "${RUN_DIR}/logs/peer_p3.log" 2>&1 &
 
 # Esperar sincronizacion inicial de la malla
@@ -94,11 +94,11 @@ sleep 5
 echo "[SLURM] Arrancando Publicadores en Nodo GPU (${GPU_NODE_1})..."
 
 srun --nodelist=${GPU_NODE_1} --nodes=1 --ntasks=1 \
-    python -c "import time, sys; print('[Publicador A] Generando eventos estocasticos...', flush=True); time.sleep(600)" \
+    python -m domains.crime.publisher --node-id pub_crime --host ${GPU_NODE_1} --port 9500 --commune Santiago --seeds-file "${RUN_DIR}/hostfile.txt" --fanout 2 --pubsub-fanout 2 --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}" \
     > "${RUN_DIR}/logs/publisher_domain_a.log" 2>&1 &
 
 srun --nodelist=${GPU_NODE_1} --nodes=1 --ntasks=1 \
-    python -c "import time, sys; print('[Publicador B] Replay serie calidad del aire...', flush=True); time.sleep(600)" \
+    python -m domains.air.publisher --node-id pub_air --host ${GPU_NODE_1} --port 9501 --commune Santiago --seeds-file "${RUN_DIR}/hostfile.txt" --fanout 2 --pubsub-fanout 2 --loop --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}" \
     > "${RUN_DIR}/logs/publisher_domain_b.log" 2>&1 &
 
 # ==========================================
@@ -106,8 +106,8 @@ srun --nodelist=${GPU_NODE_1} --nodes=1 --ntasks=1 \
 # ==========================================
 echo "[SLURM] Arrancando Frontend en Nodo GPU (${GPU_NODE_2})..."
 
-srun --nodelist=${GPU_NODE_2} --nodes=1 --ntasks=1 \
-    python -c "import time; print('[Frontend UI] Servidor listo en puerto 8501. Leyendo ${RUN_DIR}/metrics', flush=True); time.sleep(600)" \
+CIVICMESH_RUNS="${BASE_RUNS_DIR}" srun --nodelist=${GPU_NODE_2} --nodes=1 --ntasks=1 \
+    streamlit run frontend/app.py --server.port 8501 --server.address 0.0.0.0 -- --runs-dir "${BASE_RUNS_DIR}" --run-id "${RUN_ID}" \
     > "${RUN_DIR}/logs/frontend.log" 2>&1 &
 
 echo "[SLURM] CivicMesh desplegado correctamente."

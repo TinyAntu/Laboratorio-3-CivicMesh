@@ -48,7 +48,28 @@ Las pruebas en el repositorio verifican:
 
 ---
 
-## 4. Despliegue con Docker Compose
+## 4. Ejecución de Experimentos Locales
+
+Además de Docker Compose y Slurm, se incluyen scripts para orquestar simulación multi-proceso de forma local:
+
+### Experimento Individual
+```bash
+# Ejecutar simulación local del Dominio A (Delitos)
+python scripts/run_experiment.py --domain crime --num-peers 4 --duration 15
+
+# Ejecutar simulación local del Dominio B (Aire) con simulación de caída de peer
+python scripts/run_experiment.py --domain air --num-peers 5 --duration 20 --kill-peer peer1 --kill-time 8
+```
+
+### Lotes de Experimentos Aleatorios
+```bash
+# Ejecutar un lote de 3 experimentos con parámetros aleatorios
+python scripts/run_random_experiments.py --count 3
+```
+
+---
+
+## 5. Despliegue con Docker Compose
 
 El proyecto incluye un entorno Docker en contenedores preparado con **3 peers + 1 publicador + 1 frontend**:
 
@@ -70,7 +91,7 @@ docker compose down
 
 ---
 
-## 5. Despliegue en Clúster DIINF con Slurm
+## 6. Despliegue en Clúster DIINF con Slurm
 
 En el clúster DIINF, el trabajo se distribuye en **2 nodos CPU** (peers gossip/pub-sub) y **2 nodos GPU** (usando **solo la CPU del host** para publicadores y frontend UI), coordinados mediante el filesystem compartido (**Shared FS**).
 
@@ -101,7 +122,7 @@ Para evaluar la robustez de la malla ante caídas de nodos en Slurm:
 
 ---
 
-## 6. Acceso al Frontend de Estadísticas
+## 7. Acceso al Frontend de Estadísticas
 
 El Frontend (Streamlit / Web UI) lee las métricas en tiempo real desde `$CIVICMESH_RUNS/<run_id>/metrics/`.
 
@@ -111,13 +132,13 @@ El Frontend (Streamlit / Web UI) lee las métricas en tiempo real desde `$CIVICM
 - **En ejecución en Clúster Slurm**:
   Crear un túnel SSH desde su máquina local hacia el nodo donde corre la UI:
   ```bash
-  ssh -L 8501:<NODO_GPU_UI>:8501 usuario@cluster.diinf.usach.cl
+  ssh -L 8501:<NODO_GPU_UI>:8501 usuario@xi.diinf.usach.cl
   ```
   Luego acceder localmente a `http://localhost:8501`.
 
 ---
 
-## 7. Agentes de Inteligencia Artificial (Lab 2)
+## 8. Agentes de Inteligencia Artificial (Lab 2)
 
 El proyecto cuenta con 3 agentes automatizados en GitHub Actions:
 1. **Agente Documentador (`doc_agent.py`)**: Actualiza README/CHANGELOG e inspecciona cuestiones de documentación.
