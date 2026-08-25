@@ -144,3 +144,72 @@ El proyecto cuenta con 3 agentes automatizados en GitHub Actions:
 1. **Agente Documentador (`doc_agent.py`)**: Actualiza README/CHANGELOG e inspecciona cuestiones de documentación.
 2. **Agente Revisor de Bugs (`bug_agent.py`)**: Revisa el código en busca de posibles fallos de sincronización o red.
 3. **Agente Revisor de MR (`MR_agent.py`)**: Analiza y comenta en cada Pull Request / Merge Request.
+
+---
+
+## 9. Parametrización y Uso de Semillas Estocásticas (Seeds) para Reproducibilidad
+
+CivicMesh garantiza la **reproducibilidad determinista** de todos sus experimentos mediante un esquema explícito de semillas estocásticas y aislamiento de generadores pseudorandom.
+
+### 9.1 Distinción de Conceptos: Semillas Gossip vs. Semillas Estocásticas
+
+Es fundamental diferenciar los dos tipos de "semillas" presentes en el proyecto:
+
+1. **Semillas Gossip (Discovery Seeds)**:
+   - **Propósito**: Descubrimiento inicial de nodos en la red P2P.
+   - **Archivos**: `seeds.txt` (local), `seeds_compose.txt` (Docker Compose) y `hostfile.txt` (Slurm / Shared FS).
+   - **Formato**: Tuplas `node_id host port [comunas]`.
+
+2. **Semillas Estocásticas (RNG Seeds)**:
+   - **Propósito**: Inicialización del generador de números aleatorios (Random Number Generator) para garantizar la reproducibilidad exacta de los procesos estocásticos (delitos Poisson y ruidos de percepción).
+   - **Configuración**: Campo `seed` en `config/civicmesh.yaml` (ej. `seed: 42`) o argumento de línea de comandos `--seed <INT>`.
+
+### 9.2 Mecánica Interna de Generación y Aislamiento RNG
+
+Para evitar interferencia y variaciones por el orden de ejecución de hilos o subprocesos, CivicMesh crea instancias aisladas de `random.Random` utilizando claves jerárquicas hash deterministas derivadas de la semilla global (`seed`):
+
+- **Generador de Delitos (Dominio A)**:
+  ```python
+  rng = random.Random(f"{seed}:crime:{commune}:{crime_type}")
+  ```
+  Genera eventos Poisson $X_{c,k}(t) \sim \text{Poisson}(\lambda_{c,k} \Delta t)$ idénticos en cada simulación para la misma comuna y tipo de delito.
+
+- **Modelo Subjetivo de Inseguridad (Dominio A)**:
+  ```python
+  rng = random.Random(f"{seed}:crime-perception:{commune}")
+  ```
+  Genera el ruido gaussiano $\varepsilon_c(t) \sim \mathcal{N}(0, \sigma_\varepsilon^2)$ utilizado en el índice de percepción $P_c(t) = \sigma(Z_c(t))$.
+
+- **Modelo Subjetivo de Calidad del Aire (Dominio B)**:
+  ```python
+  rng = random.Random(f"{seed}:air-perception:{commune}")
+  ```
+  Genera el ruido gaussiano $\varepsilon_c(t)$ en el modelo subjetivo de picos de contaminación.
+
+- **Canal Objetivo del Aire (Dominio B)**:
+  Serie temporal real (Open-Meteo / SINCA) reproducida secuencial y deterministamente mediante `AirQualityReplay` desde `data/air_quality/*.csv`.
+
+### 9.3 Inyección de Semilla y Ejecución Reproducible
+
+Cuando se ejecuta un experimento:
+
+1. **En Orquestador Local (`scripts/run_experiment.py`)**:
+   Se puede especificar el parámetro `--seed`:
+   ```bash
+   python scripts/run_experiment.py --domain crime --num-peers 3 --seed 42 --duration 15
+   ```
+   El orquestador escribe este valor en `$CIVICMESH_RUNS/<run_id>/config.yaml`, garantizando que todos los publicadores lean exactamente la misma semilla.
+
+2. **En Lotes Aleatorios (`scripts/run_random_experiments.py`)**:
+   Cada corrida genera y registra una semilla aleatoria (e.g. `--seed 8492`) que queda plasmada en los logs y en la carpeta `$CIVICMESH_RUNS/<run_id>/config.yaml` para permitir su réplica exacta en defensas o análisis.
+
+3. **En Docker Compose / Slurm**:
+   Los contenedores y tareas de Slurm leen la semilla configurada en el archivo de configuración versionado `config/civicmesh.yaml` o el `config.yaml` creado en la corrida Shared FS.
+
+4. **Verificación Automática en CI/CD**:
+   La suite de pruebas unitarias incluye verificaciones explícitas de reproducibilidad:
+   ```bash
+   python -m pytest tests/test_crime_generator.py tests/test_crime_perception.py tests/test_air_perception.py
+   ```
+   Estas pruebas confirman que ante una misma semilla se obtiene la misma secuencia de datos objetivos y subjetivos.
+
