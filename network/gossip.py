@@ -1,5 +1,6 @@
 from __future__ import annotations
 import uuid
+import random
 from typing import Callable
 from .membership import Membership
 from .messages import Message
@@ -28,7 +29,8 @@ class Gossip:
         return Message(
             type="MEMBERSHIP_GOSSIP",
             sender_id=self.membership.self_peer.node_id,
-            msg_id=str(uuid.uuid4()),
+            # Se utiliza random.getrandbits(128) en lugar de uuid.uuid4() para respetar el determinismo estocastico del modulo random.
+            msg_id=str(uuid.UUID(int=random.getrandbits(128), version=4)),
             payload={"members": self.membership.gossip_view()},
             ttl=1,
             priority=100,

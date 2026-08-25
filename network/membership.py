@@ -10,9 +10,9 @@ from .failure_detector import FailureDetector
 
 @dataclass
 class MembershipConfig:
-    # Configuración del sistema de membresia.
+    # Configuracion del sistema de membresia.
 
-    # Cantidad maxima de nodos a los que se enviará gossip.
+    # Cantidad maxima de nodos a los que se enviara gossip.
     gossip_fanout: int = 2
     failure_timeout: float = 5.0
     suspect_timeout: float = 5.0
@@ -44,8 +44,8 @@ class Membership:
         now = time.monotonic() if now is None else now
         current = self.peers.get(peer.node_id)
 
-        # Busca si el nodo ya existe en la membresía.
-        if current is None or peer.incarnation >= current.incarnation:
+        # Busca si el nodo ya existe en la membresia.
+        if current is None or peer.incarnation > current.incarnation or (peer.incarnation == current.incarnation and current.status == "alive"):
 
             peer.last_seen = now
             peer.status = "alive"
