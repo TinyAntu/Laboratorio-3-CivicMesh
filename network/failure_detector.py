@@ -91,6 +91,18 @@ class FailureDetector:
         return changed
 
 
+    def get_state(self, node_id: str) -> FailureState | None:
+        """Retorna una copia del estado conocido de un nodo, si existe."""
+        state = self._states.get(node_id)
+        if state is None:
+            return None
+        return FailureState(
+            last_seen=state.last_seen,
+            status=state.status,
+            missed=state.missed,
+        )
+
+
     # Elimina completamente un nodo del detector.
     def remove(self, node_id: str) -> None:
         self._states.pop(node_id, None)

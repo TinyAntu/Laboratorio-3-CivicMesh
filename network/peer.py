@@ -160,6 +160,11 @@ class Peer:
     def _send_peer(self, peer: PeerInfo, message: Message) -> None:
         send_json(peer.host, peer.port, message)
 
+        # Una conexión TCP exitosa con el destino es evidencia directa de que
+        # ese peer está vivo. A diferencia de una mención indirecta en Gossip,
+        # este evento sí puede refrescar el detector de fallos.
+        self.membership.mark_seen(peer.node_id)
+
     # Enviar un mensaje a otro nodo.
     def send(self, peer: PeerInfo, message: Message) -> None:
         self._send_peer(peer, message)
@@ -328,6 +333,12 @@ class Peer:
             line, _, _ = buffer.partition(b"\n")
             message = Message.from_dict(json.loads(line.decode()))
 
+            # Cualquier mensaje recibido directamente desde un peer conocido
+            # constituye una señal de vida válida de SU emisor. Esto no afecta
+            # a terceros mencionados dentro de un mensaje Gossip.
+            if message.type != MSG_JOIN:
+                self.membership.mark_seen(message.sender_id)
+
             if message.type == MSG_JOIN:
                 peer = PeerInfo.from_dict(message.payload["peer"])
                 self.membership.add_peer(peer)
@@ -336,11 +347,9 @@ class Peer:
                 self._reply(conn, MSG_JOIN_ACK, {"members": self.membership.gossip_view()})
 
             elif message.type == MSG_PING:
-                self.membership.mark_seen(message.sender_id)
                 self._reply(conn, MSG_PONG, {"node_id": self.info.node_id})
 
             elif message.type == MSG_MEMBERSHIP_GOSSIP:
-                self.membership.mark_seen(message.sender_id)
                 self.gossip.handle(message)
                 # Sincronizar topics aprendidos
                 for m in message.payload.get("members", []):
@@ -412,10 +421,40 @@ class Peer:
                 sent = self.gossip.round()
                 changes = self.membership.run_failure_check()
                 if self.metrics:
-                    active = [p.node_id for p in self.membership.peers.values() if p.status == "alive"]
-                    suspect = [p.node_id for p in self.membership.peers.values() if p.status == "suspect"]
-                    failed = [p.node_id for p in self.membership.peers.values() if p.status == "failed"]
-                    self.metrics.record_gossip(active, suspect, failed, sent)
+                    # La vista parcial puede expulsar peers, por lo que los
+                    # conteos de liveness deben salir del FailureDetector, que
+                    # conserva la observación completa necesaria para medir
+                    # suspect/failed.
+                    liveness = self.membership.failure_detector.snapshot()
+                    active = [
+                        node_id
+                        for node_id, state in liveness.items()
+                        if state.get("status") == "alive"
+                    ]
+                    suspect = [
+                        node_id
+                        for node_id, state in liveness.items()
+                        if state.get("status") == "suspect"
+                    ]
+                    failed = [
+                        node_id
+                        for node_id, state in liveness.items()
+                        if state.get("status") == "failed"
+                    ]
+
+                    self.metrics.record_gossip(
+                        active,
+                        suspect,
+                        failed,
+                        sent,
+                        changes=changes,
+                    )
+
+                    for node_id, status in changes.items():
+                        self.metrics.record_membership_change(
+                            peer_id=node_id,
+                            status=status,
+                        )
                 if sent or changes:
                     print(
                         f"[gossip] sent={sent} changes={changes} "

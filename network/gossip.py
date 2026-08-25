@@ -52,8 +52,9 @@ class Gossip:
             except OSError:
                 pass
 
-        self.membership.run_failure_check()
-        self.membership.remove_failed()
+        # La detección de fallos se ejecuta en Peer._gossip_loop(), donde el
+        # cambio suspect/failed puede registrarse en métricas antes de cualquier
+        # limpieza. Gossip.round() se limita al intercambio de membresía.
         return sent
 
     # Procesa un mensaje recibido.
