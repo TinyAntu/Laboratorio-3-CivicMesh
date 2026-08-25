@@ -275,9 +275,13 @@ def load_metrics_from_run(run_dir: str | Path) -> list[dict[str, Any]]:
     fallback para compatibilidad con corridas antiguas que no tengan archivos
     individuales.
     """
-    metrics_path = Path(run_dir) / "metrics"
-    if not metrics_path.exists():
-        metrics_path = Path(run_dir)
+    p = Path(run_dir)
+    if (p / "metrics").exists():
+        metrics_path = p / "metrics"
+    elif (p / "metricas").exists():
+        metrics_path = p / "metricas"
+    else:
+        metrics_path = p
 
     if not metrics_path.exists():
         return []
