@@ -25,6 +25,7 @@ class AirQualityPublisher:
         replay: AirQualityReplay,
         perception_model: AirPerceptionModel,
         pollutant: str = "pm2_5",
+        subjective_only: bool = False,
     ) -> None:
         if pollutant not in {"pm2_5", "pm10"}:
             raise ValueError(
@@ -36,6 +37,7 @@ class AirQualityPublisher:
         self.replay = replay
         self.perception_model = perception_model
         self.pollutant = pollutant
+        self.subjective_only = bool(subjective_only)
         self.step = 0
 
         # Rumores subjetivos recibidos desde otros peers/publicadores
@@ -54,8 +56,12 @@ class AirQualityPublisher:
         if payload.get("channel") != CHANNEL_SUBJECTIVE:
             return
 
-        # Descartar únicamente el despacho local inmediato del propio mensaje recién emitido
-        if payload.get("source_id") == self.peer.info.node_id and message.hop_count == 0:
+        # P_gossip_c(t) solo considera rumores del mismo tópico/comuna c.
+        if payload.get("topic") != self.commune:
+            return
+
+        # Un publisher nunca debe usar su propia percepción como rumor.
+        if payload.get("source_id") == self.peer.info.node_id:
             return
 
         metadata = payload.get("metadata", {})
@@ -96,31 +102,33 @@ class AirQualityPublisher:
             self.replay.dataset.metadata.utc_offset_seconds
         )
 
-        # El canal objetivo publica las dos mediciones reales
-        # disponibles en cada muestra del CSV.
-        for pollutant, value in (
-            ("pm2_5", sample.pm2_5),
-            ("pm10", sample.pm10),
-        ):
-            self.peer.publish(
-                topic=self.commune,
-                channel=CHANNEL_OBJECTIVE,
-                value=value,
-                timestamp=timestamp,
-                metadata={
-                    "domain": "air",
-                    "step": self.step,
-                    "source": "Open-Meteo",
-                    "pollutant": pollutant,
-                    "sample_time": sample.time,
-                    "latitude": (
-                        self.replay.dataset.metadata.latitude
-                    ),
-                    "longitude": (
-                        self.replay.dataset.metadata.longitude
-                    ),
-                },
-            )
+        # El publisher secundario reproduce la misma muestra real para
+        # calcular su percepción, pero no duplica el canal objetivo.
+        if not self.subjective_only:
+            for pollutant, value in (
+                ("pm2_5", sample.pm2_5),
+                ("pm10", sample.pm10),
+            ):
+                self.peer.publish(
+                    topic=self.commune,
+                    channel=CHANNEL_OBJECTIVE,
+                    value=value,
+                    timestamp=timestamp,
+                    metadata={
+                        "domain": "air",
+                        "step": self.step,
+                        "source": "Open-Meteo",
+                        "pollutant": pollutant,
+                        "sample_time": sample.time,
+                        "latitude": (
+                            self.replay.dataset.metadata.latitude
+                        ),
+                        "longitude": (
+                            self.replay.dataset.metadata.longitude
+                        ),
+                        "source_role": "primary",
+                    },
+                )
 
         gossip_value = self._consume_gossip_value()
 
@@ -145,10 +153,15 @@ class AirQualityPublisher:
                 ),
                 "gossip_value": gossip_value,
                 "objective_value": objective_value,
+                "source_role": (
+                    "subjective_only"
+                    if self.subjective_only
+                    else "primary"
+                ),
             },
         )
 
-        if self.peer.metrics:
+        if self.peer.metrics and not self.subjective_only:
             self.peer.metrics.record_step(
                 domain="air",
                 commune=self.commune,
@@ -181,6 +194,11 @@ def main() -> int:
     parser.add_argument("--runs-dir", default=None, help="Base directory for runs")
     parser.add_argument("--run-id", default=None, help="Identifier for current run")
     parser.add_argument("--topics", default="", help="Comma-separated topics to subscribe for rumors")
+    parser.add_argument(
+        "--subjective-only",
+        action="store_true",
+        help="Publica solo el canal subjetivo; la muestra real se reproduce localmente pero no se reenvía.",
+    )
     args = parser.parse_args()
 
     config = ConfigLoader.load(args.config)
@@ -205,6 +223,12 @@ def main() -> int:
         port=args.port,
         fanout=args.fanout,
         pubsub_fanout=args.pubsub_fanout,
+        pubsub_fanout_objective=config.pubsub.objective.fanout,
+        pubsub_fanout_subjective=config.pubsub.subjective.fanout,
+        ttl_objective=config.pubsub.objective.ttl,
+        ttl_subjective=config.pubsub.subjective.ttl,
+        priority_objective=config.pubsub.objective.priority,
+        priority_subjective=config.pubsub.subjective.priority,
         seed=config.seed,
         runs_dir=args.runs_dir,
         run_id=args.run_id,
@@ -235,6 +259,7 @@ def main() -> int:
             config.seed,
         ),
         pollutant=config.air.pollutant,
+        subjective_only=args.subjective_only,
     )
 
     try:
@@ -245,7 +270,8 @@ def main() -> int:
                 f"[air] commune={args.commune} "
                 f"step={publisher.step - 1} "
                 f"{publisher.pollutant}={objective:.2f} "
-                f"perception={perception:.2f}",
+                f"perception={perception:.2f} "
+                f"mode={'subjective-only' if publisher.subjective_only else 'primary'}",
                 flush=True,
             )
 

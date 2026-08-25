@@ -32,7 +32,8 @@ class MetricsCollector:
         self.metrics_dir.mkdir(parents=True, exist_ok=True)
         
         self.node_file = self.metrics_dir / f"{self.node_id}.jsonl"
-        self.summary_file = self.metrics_dir / "events.jsonl"
+        # Cada collector escribe únicamente en su archivo por nodo.
+        # Esto evita contención entre procesos/hosts sobre un JSONL compartido.
         self._lock = threading.Lock()
         
         # Contadores en memoria
@@ -47,17 +48,18 @@ class MetricsCollector:
             "hops_count": 0,
         }
 
-    def _write_record(self, record: dict[str, Any], also_summary: bool = True) -> None:
+    def _write_record(self, record: dict[str, Any]) -> None:
+        """Escribe un registro en el JSONL exclusivo de este nodo.
+
+        El archivo por nodo es la fuente de verdad de las métricas. Evitamos
+        escribir en un ``events.jsonl`` compartido porque los collectors pueden
+        vivir en procesos e incluso hosts distintos, donde un ``threading.Lock``
+        de instancia no ofrece exclusión mutua entre escritores.
+        """
         line = json.dumps(record, separators=(",", ":")) + "\n"
         with self._lock:
             with open(self.node_file, "a", encoding="utf-8") as fh:
                 fh.write(line)
-            if also_summary:
-                try:
-                    with open(self.summary_file, "a", encoding="utf-8") as fh:
-                        fh.write(line)
-                except OSError:
-                    pass
 
     def record_publish(
         self,
@@ -140,7 +142,7 @@ class MetricsCollector:
             "remaining_ttl": remaining_ttl,
             "hop_count": hop_count,
         }
-        self._write_record(record, also_summary=False)
+        self._write_record(record)
 
     def record_drop(self, reason: str, msg_id: str, topic: str = "", channel: str = "") -> None:
         with self._lock:
@@ -160,7 +162,7 @@ class MetricsCollector:
             "topic": topic,
             "channel": channel,
         }
-        self._write_record(record, also_summary=False)
+        self._write_record(record)
 
     def record_gossip(
         self,
@@ -180,7 +182,7 @@ class MetricsCollector:
             "active_peers": active_peers,
             "failed_peers": failed_peers,
         }
-        self._write_record(record, also_summary=False)
+        self._write_record(record)
 
     def record_step(
         self,
@@ -209,38 +211,63 @@ class MetricsCollector:
             "gossip_value": gossip_value,
             "metadata": metadata or {},
         }
-        self._write_record(record, also_summary=True)
+        self._write_record(record)
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Lee un JSONL ignorando líneas parciales o corruptas."""
+    records: list[dict[str, Any]] = []
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    # Una línea parcial no debe impedir analizar el resto
+                    # de las métricas de una corrida en curso.
+                    continue
+    except OSError:
+        pass
+
+    return records
 
 
 def load_metrics_from_run(run_dir: str | Path) -> list[dict[str, Any]]:
-    """Carga todos los registros JSONL de una corrida específica."""
+    """Carga las métricas completas de una corrida.
+
+    Los archivos ``{node_id}.jsonl`` son la fuente de verdad porque cada uno
+    tiene un único escritor. ``events.jsonl`` se conserva únicamente como
+    fallback para compatibilidad con corridas antiguas que no tengan archivos
+    individuales.
+    """
     metrics_path = Path(run_dir) / "metrics"
     if not metrics_path.exists():
         metrics_path = Path(run_dir)
 
-    records: list[dict[str, Any]] = []
+    if not metrics_path.exists():
+        return []
+
     events_file = metrics_path / "events.jsonl"
 
-    if events_file.exists():
-        with open(events_file, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if line:
-                    try:
-                        records.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        pass
-        return sorted(records, key=lambda r: float(r.get("timestamp", 0)))
+    # Preferir siempre archivos individuales. En las corridas antiguas estos
+    # contienen publish/delivery/step y también forward/drop/gossip, mientras
+    # que events.jsonl podía contener solo un subconjunto.
+    individual_files = sorted(
+        path
+        for path in metrics_path.glob("*.jsonl")
+        if path.name != "events.jsonl"
+    )
 
-    # Fallback: leer todos los .jsonl del directorio
-    for f in metrics_path.glob("*.jsonl"):
-        with open(f, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if line:
-                    try:
-                        records.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        pass
+    records: list[dict[str, Any]] = []
+
+    if individual_files:
+        for path in individual_files:
+            records.extend(_read_jsonl(path))
+    elif events_file.exists():
+        records.extend(_read_jsonl(events_file))
 
     return sorted(records, key=lambda r: float(r.get("timestamp", 0)))

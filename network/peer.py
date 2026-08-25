@@ -28,6 +28,7 @@ from .messages import (
 )
 from .metrics import MetricsCollector
 from .pubsub import PubSubEngine, PubSubConfig
+from .state import LocalAggregateState
 from .topology import GeoTopology
 
 
@@ -47,7 +48,14 @@ class Peer:
         host: str,
         port: int,
         fanout: int = 2,
-        pubsub_fanout: int = 3,
+        max_view_size: int = 8,
+        pubsub_fanout: int | None = None,
+        pubsub_fanout_objective: int | None = None,
+        pubsub_fanout_subjective: int | None = None,
+        ttl_objective: int = 3,
+        ttl_subjective: int = 5,
+        priority_objective: int = 80,
+        priority_subjective: int = 50,
         failure_timeout: float = 5.0,
         suspect_timeout: float = 5.0,
         seed: int | None = None,
@@ -67,22 +75,86 @@ class Peer:
             self.info,
             MembershipConfig(
                 gossip_fanout=fanout,
+                max_view_size=max_view_size,
                 failure_timeout=failure_timeout,
                 suspect_timeout=suspect_timeout,
             ),
             seed=seed,
         )
         self.gossip = Gossip(self.membership, self._send_peer)
+
+        # Compatibilidad: --pubsub-fanout sigue pudiendo fijar un valor común,
+        # pero los valores por canal tienen precedencia si se entregan.
+        legacy_pubsub_fanout = 3 if pubsub_fanout is None else int(pubsub_fanout)
+        resolved_fanout_objective = (
+            legacy_pubsub_fanout
+            if pubsub_fanout_objective is None
+            else int(pubsub_fanout_objective)
+        )
+        resolved_fanout_subjective = (
+            legacy_pubsub_fanout
+            if pubsub_fanout_subjective is None
+            else int(pubsub_fanout_subjective)
+        )
+
         self.pubsub = PubSubEngine(
             self_peer=self.info,
             send_fn=self._send_peer,
-            config=PubSubConfig(pubsub_fanout=pubsub_fanout),
+            config=PubSubConfig(
+                fanout_objective=resolved_fanout_objective,
+                fanout_subjective=resolved_fanout_subjective,
+                default_ttl_objective=ttl_objective,
+                default_ttl_subjective=ttl_subjective,
+                default_priority_objective=priority_objective,
+                default_priority_subjective=priority_subjective,
+            ),
             topology=topology or GeoTopology(),
             seed=seed,
             metrics_collector=self.metrics,
         )
+
+        # Estado agregado local por tópico y canal. Se registra como primer
+        # handler interno para actualizarlo antes de ejecutar callbacks externos.
+        self.state = LocalAggregateState()
+        self.pubsub.register_handler(self._update_local_state)
+
         self.running = False
         self.server: socket.socket | None = None
+
+    def _update_local_state(self, message: Message) -> None:
+        """Actualiza el estado agregado cuando Pub/Sub entrega un PUBLISH local."""
+        if message.type != MSG_PUBLISH:
+            return
+
+        payload = message.payload
+        topic = str(payload.get("topic", ""))
+        channel = str(payload.get("channel", ""))
+
+        if not topic or not channel:
+            return
+
+        try:
+            timestamp = float(payload.get("timestamp", time.time()))
+        except (TypeError, ValueError):
+            timestamp = time.time()
+
+        self.state.update(
+            topic=topic,
+            channel=channel,
+            value=payload.get("value"),
+            timestamp=timestamp,
+            source_id=str(payload.get("source_id", message.sender_id)),
+            msg_id=message.msg_id,
+            metadata=payload.get("metadata", {}),
+        )
+
+    def get_local_state(self) -> dict[str, Any]:
+        """Retorna una copia del estado agregado local completo del peer."""
+        return self.state.snapshot()
+
+    def get_topic_state(self, topic: str) -> dict[str, Any]:
+        """Retorna una copia del estado agregado local de un tópico."""
+        return self.state.topic_state(topic)
 
     # Envia un mensaje a un nodo especifico.
     def _send_peer(self, peer: PeerInfo, message: Message) -> None:
@@ -152,7 +224,7 @@ class Peer:
 
         # Reenviar a peers según la política de fanout de pubsub
         candidates = list(self.membership.peers.values())
-        targets = self.pubsub.config.pubsub_fanout
+        targets = self.pubsub.config.fanout_for_channel(channel)
         from .pubsub import select_forward_targets
         chosen = select_forward_targets(
             msg=msg,
@@ -211,7 +283,9 @@ class Peer:
             f"[peer] node={self.info.node_id} "
             f"listen={self.info.host}:{self.info.port} "
             f"gossip_fanout={self.membership.config.gossip_fanout} "
-            f"pubsub_fanout={self.pubsub.config.pubsub_fanout} "
+            f"max_view_size={self.membership.config.max_view_size} "
+            f"pubsub_fanout_objective={self.pubsub.config.fanout_objective} "
+            f"pubsub_fanout_subjective={self.pubsub.config.fanout_subjective} "
             f"topics={self.info.topics}",
             flush=True,
         )
@@ -372,7 +446,19 @@ def main() -> int:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--seeds-file")
     parser.add_argument("--fanout", type=int, default=2, help="Gossip membership fanout")
-    parser.add_argument("--pubsub-fanout", type=int, default=3, help="PubSub message fanout")
+    parser.add_argument("--max-view-size", type=int, default=8, help="Maximum local membership view size")
+    parser.add_argument(
+        "--pubsub-fanout",
+        type=int,
+        default=None,
+        help="Legacy: aplica el mismo fanout PubSub a ambos canales",
+    )
+    parser.add_argument("--pubsub-fanout-objective", type=int, default=None)
+    parser.add_argument("--pubsub-fanout-subjective", type=int, default=None)
+    parser.add_argument("--ttl-objective", type=int, default=3)
+    parser.add_argument("--ttl-subjective", type=int, default=5)
+    parser.add_argument("--priority-objective", type=int, default=80)
+    parser.add_argument("--priority-subjective", type=int, default=50)
     parser.add_argument("--failure-timeout", type=float, default=5.0)
     parser.add_argument("--suspect-timeout", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=42)
@@ -386,7 +472,14 @@ def main() -> int:
         host=args.host,
         port=args.port,
         fanout=args.fanout,
+        max_view_size=args.max_view_size,
         pubsub_fanout=args.pubsub_fanout,
+        pubsub_fanout_objective=args.pubsub_fanout_objective,
+        pubsub_fanout_subjective=args.pubsub_fanout_subjective,
+        ttl_objective=args.ttl_objective,
+        ttl_subjective=args.ttl_subjective,
+        priority_objective=args.priority_objective,
+        priority_subjective=args.priority_subjective,
         failure_timeout=args.failure_timeout,
         suspect_timeout=args.suspect_timeout,
         seed=args.seed,

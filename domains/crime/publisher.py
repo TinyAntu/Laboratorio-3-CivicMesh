@@ -24,12 +24,14 @@ class CrimePublisher:
         generator: CrimeGenerator,
         perception_model: CrimePerceptionModel,
         delta_t: float,
+        subjective_only: bool = False,
     ) -> None:
         self.peer = peer
         self.commune = commune
         self.generator = generator
         self.perception_model = perception_model
         self.delta_t = float(delta_t)
+        self.subjective_only = bool(subjective_only)
         self.step = 0
 
         # Rumores subjetivos recibidos desde otros peers/publicadores
@@ -48,8 +50,12 @@ class CrimePublisher:
         if payload.get("channel") != CHANNEL_SUBJECTIVE:
             return
 
-        # Descartar únicamente el despacho local inmediato del propio mensaje recién emitido
-        if payload.get("source_id") == self.peer.info.node_id and message.hop_count == 0:
+        # P_gossip_c(t) solo considera rumores del mismo tópico/comuna c.
+        if payload.get("topic") != self.commune:
+            return
+
+        # Un publisher nunca debe usar su propia percepción como rumor.
+        if payload.get("source_id") == self.peer.info.node_id:
             return
 
         metadata = payload.get("metadata", {})
@@ -77,19 +83,23 @@ class CrimePublisher:
         events = self.generator.generate(self.commune, logical_time)
         total_crimes = self.generator.total(events)
 
-        for event in events:
-            self.peer.publish(
-                topic=self.commune,
-                channel=CHANNEL_OBJECTIVE,
-                value=event.count,
-                timestamp=event.timestamp,
-                metadata={
-                    "domain": "crime",
-                    "crime_type": event.crime_type,
-                    "step": self.step,
-                    "delta_t": self.delta_t,
-                },
-            )
+        # El publisher secundario calcula el mismo ground truth local
+        # para alimentar su percepción, pero no vuelve a publicarlo.
+        if not self.subjective_only:
+            for event in events:
+                self.peer.publish(
+                    topic=self.commune,
+                    channel=CHANNEL_OBJECTIVE,
+                    value=event.count,
+                    timestamp=event.timestamp,
+                    metadata={
+                        "domain": "crime",
+                        "crime_type": event.crime_type,
+                        "step": self.step,
+                        "delta_t": self.delta_t,
+                        "source_role": "primary",
+                    },
+                )
 
         gossip_value = self._consume_gossip_value()
 
@@ -110,10 +120,15 @@ class CrimePublisher:
                 "total_crimes": total_crimes,
                 "memory": self.perception_model.memory(self.commune),
                 "gossip_value": gossip_value,
+                "source_role": (
+                    "subjective_only"
+                    if self.subjective_only
+                    else "primary"
+                ),
             },
         )
 
-        if self.peer.metrics:
+        if self.peer.metrics and not self.subjective_only:
             self.peer.metrics.record_step(
                 domain="crime",
                 commune=self.commune,
@@ -144,6 +159,11 @@ def main() -> int:
     parser.add_argument("--runs-dir", default=None, help="Base directory for runs")
     parser.add_argument("--run-id", default=None, help="Identifier for current run")
     parser.add_argument("--topics", default="", help="Comma-separated topics to subscribe for rumors")
+    parser.add_argument(
+        "--subjective-only",
+        action="store_true",
+        help="Publica solo el canal subjetivo; el ground truth se calcula localmente pero no se reenvía.",
+    )
     args = parser.parse_args()
 
     config = ConfigLoader.load(args.config)
@@ -159,6 +179,12 @@ def main() -> int:
         port=args.port,
         fanout=args.fanout,
         pubsub_fanout=args.pubsub_fanout,
+        pubsub_fanout_objective=config.pubsub.objective.fanout,
+        pubsub_fanout_subjective=config.pubsub.subjective.fanout,
+        ttl_objective=config.pubsub.objective.ttl,
+        ttl_subjective=config.pubsub.subjective.ttl,
+        priority_objective=config.pubsub.objective.priority,
+        priority_subjective=config.pubsub.subjective.priority,
         seed=config.seed,
         runs_dir=args.runs_dir,
         run_id=args.run_id,
@@ -190,6 +216,7 @@ def main() -> int:
             config.seed,
         ),
         delta_t=config.simulation.delta_t,
+        subjective_only=args.subjective_only,
     )
 
     try:
@@ -200,7 +227,8 @@ def main() -> int:
                 f"[crime] commune={args.commune} "
                 f"step={publisher.step - 1} "
                 f"total={total} "
-                f"perception={perception:.4f}",
+                f"perception={perception:.4f} "
+                f"mode={'subjective-only' if publisher.subjective_only else 'primary'}",
                 flush=True,
             )
 

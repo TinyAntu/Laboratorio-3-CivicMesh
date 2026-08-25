@@ -24,8 +24,14 @@ from .topology import GeoTopology, DEFAULT_COMMUNE_ADJACENCY
 
 @dataclass
 class PubSubConfig:
-    """Configuración de la capa Pub/Sub."""
-    pubsub_fanout: int = 3
+    """Configuración de la capa Pub/Sub por canal."""
+
+    # Campo legado: si se entrega, aplica el mismo fanout a ambos canales.
+    # Se conserva para no romper llamadas antiguas/tests.
+    pubsub_fanout: int | None = None
+
+    fanout_objective: int = 3
+    fanout_subjective: int = 3
     default_ttl_objective: int = 3
     default_priority_objective: int = 80
     default_ttl_subjective: int = 5
@@ -33,6 +39,23 @@ class PubSubConfig:
     min_forward_priority: int = 0
     max_dedup_cache_size: int = 5000
     cache_ttl_seconds: float = 300.0
+
+    def __post_init__(self) -> None:
+        if self.pubsub_fanout is not None:
+            self.fanout_objective = int(self.pubsub_fanout)
+            self.fanout_subjective = int(self.pubsub_fanout)
+
+        if self.fanout_objective <= 0:
+            raise ValueError("fanout_objective debe ser mayor que 0")
+        if self.fanout_subjective <= 0:
+            raise ValueError("fanout_subjective debe ser mayor que 0")
+
+    def fanout_for_channel(self, channel: str) -> int:
+        if channel == CHANNEL_OBJECTIVE:
+            return self.fanout_objective
+        if channel == CHANNEL_SUBJECTIVE:
+            return self.fanout_subjective
+        return max(self.fanout_objective, self.fanout_subjective)
 
 
 class Deduplicator:
@@ -436,7 +459,7 @@ class PubSubEngine:
                 msg=msg,
                 topic=topic,
                 candidates=peers_list,
-                fanout=self.config.pubsub_fanout,
+                fanout=self.config.fanout_for_channel(msg.payload.get("channel", "")),
                 subscription_manager=self.subscriptions,
                 topology=self.topology,
                 rng=self.rng,
